@@ -12,6 +12,7 @@ router.post("/:id/join", auth, trainingController.joinSession);
 router.post("/:id/leave", auth, trainingController.leaveSession);
 router.post("/:id/participants", auth, trainingController.addParticipantToSession);
 router.delete("/:id/participants/:participantId", auth, trainingController.removeParticipantFromSession);
+router.put("/:id/chronos", auth, trainingController.saveChronos);
 router.put("/:id", auth, trainingController.updateSession);
 router.delete("/:id", auth, trainingController.deleteSession);
 

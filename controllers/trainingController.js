@@ -133,6 +133,37 @@ const isUserMemberOfGroup = (group, userId) => {
     return group.members?.some((member) => toStringId(member.user) === userId) || false;
 };
 
+const parseChronoToSeconds = (value) => {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    const trimmed = value.toString().trim();
+    if (!trimmed) {
+        return null;
+    }
+    const normalized = trimmed.replace(",", ".");
+    const colonParts = normalized.split(":").map((part) => part.trim());
+    if (colonParts.length === 1) {
+        const single = Number(normalized);
+        return Number.isFinite(single) && single >= 0 ? single : null;
+    }
+    let totalSeconds = 0;
+    for (let i = 0; i < colonParts.length; i += 1) {
+        const part = Number(colonParts[colonParts.length - 1 - i]);
+        if (!Number.isFinite(part) || part < 0) {
+            return null;
+        }
+        if (i === 0) {
+            totalSeconds += part;
+        } else if (i === 1) {
+            totalSeconds += part * 60;
+        } else if (i === 2) {
+            totalSeconds += part * 3600;
+        }
+    }
+    return totalSeconds;
+};
+
 exports.createSession = async (req, res) => {
     try {
         const {
@@ -353,6 +384,81 @@ exports.detachSessionFromGroup = async (req, res) => {
     }
 };
 
+exports.saveChronos = async (req, res) => {
+    try {
+        const session = await TrainingSession.findById(req.params.id).populate(sessionPopulationPaths);
+        if (!session) {
+            return res.status(404).json({ message: "Séance introuvable" });
+        }
+
+        const ownerId = toStringId(session.athleteId);
+        if (ownerId !== req.user.id) {
+            return res.status(403).json({ message: "Seul le créateur de la séance peut enregistrer les chronos" });
+        }
+
+        const allowedParticipants = new Set();
+        if (ownerId) {
+            allowedParticipants.add(ownerId);
+        }
+        (session.participants || []).forEach((participant) => {
+            const participantId = toStringId(participant.user);
+            if (participantId) {
+                allowedParticipants.add(participantId);
+            }
+        });
+
+        const entries = Array.isArray(req.body.entries) ? req.body.entries : [];
+        const normalizedChronos = entries
+            .map((entry) => {
+                const participantId = toStringId(entry.participantId || entry.participant);
+                const seriesId = entry.seriesId ? entry.seriesId.toString() : null;
+                const segmentId = entry.segmentId ? entry.segmentId.toString() : null;
+                const time = typeof entry.time === "string" ? entry.time.trim() : "";
+
+                if (!participantId || !allowedParticipants.has(participantId)) {
+                    return null;
+                }
+                if (!seriesId || !segmentId || !time) {
+                    return null;
+                }
+
+                const distanceValue = Number(entry.distance);
+                const secondsValue = parseChronoToSeconds(time);
+                const parsedSeriesIndex = Number(entry.seriesIndex);
+                const parsedRepeatIndex = Number(entry.repeatIndex);
+                const parsedSegmentIndex = Number(entry.segmentIndex);
+                const parsedRepetitionIndex = Number(entry.repetitionIndex);
+
+                return {
+                    participant: participantId,
+                    seriesId,
+                    seriesIndex: Number.isFinite(parsedSeriesIndex) ? parsedSeriesIndex : 0,
+                    repeatIndex: Number.isFinite(parsedRepeatIndex) ? parsedRepeatIndex : 0,
+                    segmentId,
+                    segmentIndex: Number.isFinite(parsedSegmentIndex) ? parsedSegmentIndex : 0,
+                    repetitionIndex: Number.isFinite(parsedRepetitionIndex) ? parsedRepetitionIndex : 0,
+                    distance: Number.isFinite(distanceValue) && distanceValue >= 0 ? distanceValue : undefined,
+                    time,
+                    seconds: secondsValue !== null ? secondsValue : undefined,
+                    updatedAt: new Date(),
+                    updatedBy: req.user.id,
+                };
+            })
+            .filter(Boolean);
+
+        session.chronos = normalizedChronos;
+        session.markModified("chronos");
+        await ensureAutomaticStatus(session);
+        await session.save();
+        await session.populate(sessionPopulationPaths);
+
+        res.json(session);
+    } catch (error) {
+        console.error("Erreur enregistrement chronos séance:", error);
+        res.status(500).json({ message: "Impossible d'enregistrer les chronos" });
+    }
+};
+
 exports.listParticipantSessions = async (req, res) => {
     try {
         const sessions = await TrainingSession.find({ "participants.user": req.user.id })
@@ -489,11 +595,13 @@ exports.joinSession = async (req, res) => {
             existingParticipant.status = "confirmed";
             existingParticipant.addedBy = existingParticipant.addedBy || req.user.id;
             existingParticipant.addedAt = existingParticipant.addedAt || new Date();
+            existingParticipant.confirmedAt = new Date();
         } else {
             session.participants.push({
                 user: req.user.id,
                 addedBy: req.user.id,
                 addedAt: new Date(),
+                confirmedAt: new Date(),
                 status: "confirmed",
             });
         }

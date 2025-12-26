@@ -2,13 +2,16 @@ const mongoose = require("mongoose");
 
 const performanceTimelineSchema = new mongoose.Schema(
     {
-        date: { type: Date, required: true },
-        value: { type: Number, required: true },
+        date: { type: Date, required: false },
+        rawDate: { type: String, trim: true },
+        year: { type: Number, required: false },
+        value: { type: String, required: true }, // garder la performance brute (ex: "23''44")
         discipline: { type: String, required: true, trim: true },
         meeting: { type: String, trim: true },
         city: { type: String, trim: true },
         surface: { type: String, trim: true },
         notes: { type: String, trim: true },
+        source: { type: String, trim: true },
     },
     { _id: true, timestamps: false }
 );
@@ -26,12 +29,15 @@ const userSchema = new mongoose.Schema(
     {
         // 🔹 Informations de base
         fullName: { type: String, required: true, trim: true, minlength: 2, maxlength: 50 },
-        username: { type: String, required: false, trim: true },
+        firstName: { type: String, required: true, trim: true, minlength: 1, maxlength: 50 },
+        lastName: { type: String, required: true, trim: true, minlength: 1, maxlength: 50 },
+        username: { type: String, required: false, trim: true, unique: true, sparse: true },
         email: { type: String, required: true, unique: true, lowercase: true },
         passwordHash: { type: String, required: true },
+        role: { type: String, enum: ["athlete", "coach"], default: "athlete" },
 
         // 🔹 Informations personnelles
-        gender: { type: String, enum: ["male", "female", "other"], default: "other" },
+        gender: { type: String, enum: ["male", "female"], default: "female" },
         birthDate: { type: Date, required: false },
         country: { type: String, required: false },
         city: { type: String },
@@ -55,6 +61,7 @@ const userSchema = new mongoose.Schema(
 
         // 🔹 Performances & statistiques
         records: { type: Map, of: String }, // ex: { "400m": "50.62s" }
+        recordPoints: { type: Map, of: Number },
         competitionsCount: { type: Number, default: 0 },
         challengesCount: { type: Number, default: 0 },
         rankGlobal: { type: Number, default: 0 },
@@ -111,6 +118,10 @@ const userSchema = new mongoose.Schema(
         rpmAvatarMeta: { type: mongoose.Schema.Types.Mixed },
         rpmUserId: { type: String },
         rpmUserToken: { type: String, select: false },
+
+        // 🔹 Résultats FFA importés
+        ffaResultsByYear: { type: mongoose.Schema.Types.Mixed }, // { [year]: { [epreuve]: Entry[] } }
+        ffaMergedByEvent: { type: mongoose.Schema.Types.Mixed }, // { [epreuve]: Entry[] }
     },
     {
         timestamps: true, // ajoute createdAt et updatedAt automatiquement

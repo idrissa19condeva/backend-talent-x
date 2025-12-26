@@ -5,7 +5,26 @@ const participantSchema = new mongoose.Schema(
         user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
         addedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
         addedAt: { type: Date, default: Date.now },
+        confirmedAt: { type: Date },
         status: { type: String, enum: ["pending", "confirmed"], default: "pending" },
+    },
+    { _id: false }
+);
+
+const chronoEntrySchema = new mongoose.Schema(
+    {
+        participant: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+        seriesId: { type: String, required: true, trim: true },
+        seriesIndex: { type: Number, min: 0, default: 0 },
+        repeatIndex: { type: Number, min: 0, default: 0 },
+        segmentId: { type: String, required: true, trim: true },
+        segmentIndex: { type: Number, min: 0, default: 0 },
+        repetitionIndex: { type: Number, min: 0, default: 0 },
+        distance: { type: Number, min: 0 },
+        time: { type: String, required: true, trim: true },
+        seconds: { type: Number, min: 0 },
+        updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        updatedAt: { type: Date, default: Date.now },
     },
     { _id: false }
 );
@@ -110,6 +129,44 @@ const normalizeParticipantForJson = (participant) => {
     return normalized;
 };
 
+const toNormalizedId = (value) => {
+    if (!value) {
+        return value;
+    }
+    if (typeof value === "string") {
+        return value;
+    }
+    if (typeof value === "object") {
+        if (value._id) {
+            return value._id.toString();
+        }
+        if (value.id) {
+            return value.id.toString();
+        }
+    }
+    return value.toString();
+};
+
+const normalizeChronoForJson = (entry) => {
+    if (!entry) {
+        return entry;
+    }
+
+    const normalized = { ...entry };
+    const participantId = toNormalizedId(entry.participant || entry.participantId);
+    const updatedBy = toNormalizedId(entry.updatedBy);
+
+    normalized.participantId = participantId;
+    if (updatedBy) {
+        normalized.updatedBy = updatedBy;
+    }
+
+    delete normalized.participant;
+    delete normalized._id;
+
+    return normalized;
+};
+
 const buildUserPreview = (value) => {
     if (!value) {
         return null;
@@ -147,6 +204,7 @@ const trainingSessionSchema = new mongoose.Schema(
         athleteFeedback: { type: String, trim: true },
         equipment: { type: String, trim: true },
         participants: { type: [participantSchema], default: [] },
+        chronos: { type: [chronoEntrySchema], default: [] },
         group: { type: mongoose.Schema.Types.ObjectId, ref: "TrainingGroup", index: true },
         status: { type: String, enum: ["planned", "ongoing", "canceled", "done", "postponed"], default: "planned" },
     },
@@ -187,6 +245,9 @@ trainingSessionSchema.set("toJSON", {
                 ret.groupId = normalizedGroupId;
                 ret.group = { id: normalizedGroupId };
             }
+        }
+        if (Array.isArray(ret.chronos)) {
+            ret.chronos = ret.chronos.map(normalizeChronoForJson);
         }
         return ret;
     },

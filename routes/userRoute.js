@@ -20,6 +20,7 @@ router.post("/photo", auth, upload.single("photo"), userController.uploadPhoto);
 router.get("/search", auth, userController.searchUsers);
 router.put("/:id/performances", auth, userController.updatePerformances);
 router.get("/performance-timeline", auth, userController.getPerformanceTimeline);
+router.get("/ffa/performance-timeline", auth, userController.getFfaPerformanceTimeline);
 router.post("/performance-timeline", auth, userController.addPerformanceTimelinePoint);
 router.put("/records", auth, userController.updateRecords);
 router.post("/:id/friend-request", auth, userController.sendFriendRequest);

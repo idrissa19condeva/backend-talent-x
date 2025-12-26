@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const { buildPerformancePoints } = require("../services/ffaService");
 
 const sanitizeMapMerge = (source, incoming) => {
     if (!incoming || typeof incoming !== "object") return source;
@@ -44,6 +45,83 @@ const pushUniqueObjectId = (collection = [], target) => {
     return list;
 };
 
+const monthMap = {
+    janvier: 0, janv: 0,
+    fevrier: 1, février: 1, fev: 1, fév: 1,
+    mars: 2,
+    avril: 3, avr: 3,
+    mai: 4,
+    juin: 5,
+    juillet: 6, juil: 6,
+    aout: 7, août: 7,
+    septembre: 8, sept: 8,
+    octobre: 9, oct: 9,
+    novembre: 10, nov: 10,
+    decembre: 11, décembre: 11, dec: 11, déc: 11,
+};
+
+const parseFrenchDate = (value, yearHint) => {
+    if (!value) return null;
+    const raw = value.trim().replace(/\./g, "").toLowerCase();
+    const match = raw.match(/^(\d{1,2})\s+([a-zéûô]+)/i);
+    if (!match) return null;
+    const day = Number(match[1]);
+    const month = monthMap[match[2]];
+    if (month === undefined || Number.isNaN(day)) return null;
+    const year = Number(yearHint) || new Date().getFullYear();
+    const d = new Date(year, month, day);
+    return Number.isNaN(d.getTime()) ? null : d;
+};
+
+const parsePerformanceToNumber = (value) => {
+    if (!value) return null;
+    const str = String(value).trim().toLowerCase();
+    if (str.includes(":")) {
+        const [m, s] = str.split(":");
+        const minutes = Number(m);
+        const seconds = Number(s?.replace(/[^0-9.,-]/g, "").replace(/,/g, "."));
+        if (Number.isFinite(minutes) && Number.isFinite(seconds)) return minutes * 60 + seconds;
+    }
+    const normalized = str.replace(/''/g, ".").replace(/’/g, "'").replace(/[^0-9.,-]/g, "").replace(/,/g, ".");
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildFfaTimelines = (ffaMergedByEvent = {}) => {
+    const timelines = {};
+    for (const [epreuve, entries] of Object.entries(ffaMergedByEvent || {})) {
+        if (!Array.isArray(entries) || entries.length === 0) continue;
+        const mapped = entries
+            .map((entry) => {
+                const dateObj = parseFrenchDate(entry.date, entry.year);
+                const timestamp = dateObj ? dateObj.getTime() : null;
+                const value = parsePerformanceToNumber(entry.performance);
+                if (!Number.isFinite(value) || timestamp === null) return null;
+                return {
+                    date: new Date(timestamp).toISOString(),
+                    rawDate: entry.date,
+                    year: entry.year ? Number(entry.year) || undefined : undefined,
+                    value,
+                    discipline: epreuve,
+                    meeting: entry.lieu,
+                    city: entry.lieu,
+                    surface: entry.niveau,
+                    notes: entry.tour,
+                    place: entry.place,
+                    points: entry.points ? Number(entry.points) || undefined : undefined,
+                    timestamp,
+                };
+            })
+            .filter(Boolean)
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+        if (mapped.length > 0) {
+            timelines[epreuve] = mapped.map(({ timestamp, ...rest }) => rest);
+        }
+    }
+    return timelines;
+};
+
 const buildRelationshipPayload = (userDoc, viewerId) => {
     const viewer = toObjectIdString(viewerId);
     const userId = toObjectIdString(userDoc?._id);
@@ -83,8 +161,19 @@ exports.getProfile = async (req, res) => {
     try {
         const user = await User.findById(req.user.id).select("-passwordHash -rpmUserToken");
         if (!user) return res.status(404).json({ message: "Utilisateur non trouvé" });
-        const payload = user.toObject();
+
+        const payload = user.toObject({ flattenMaps: true });
+        payload.records = payload.records || {};
+        payload.recordPoints = payload.recordPoints || {};
+        payload.seasonPerformances = payload.seasonPerformances || {};
+        payload.performances = payload.performances || [];
+        payload.performanceTimeline = payload.performanceTimeline || [];
+        if (payload.performanceTimeline.length === 0 && payload.ffaResultsByYear) {
+            // Build frontend-ready timeline from stored FFA results
+            payload.performanceTimeline = buildPerformancePoints(payload.ffaResultsByYear);
+        }
         payload.relationship = buildRelationshipPayload(user, req.user.id);
+
         res.json(payload);
     } catch (error) {
         res.status(500).json({ message: "Erreur serveur", error });
@@ -99,7 +188,7 @@ exports.updateProfile = async (req, res) => {
             "mainDiscipline", "otherDisciplines", "club", "level", "goals",
             "dominantLeg", "favoriteCoach", "isProfilePublic", "notificationsEnabled", "autoSharePerformance",
             "theme", "instagram", "strava", "tiktok", "website", "category", "performances",
-            "rpmAvatarUrl", "rpmAvatarPreviewUrl", "rpmAvatarMeta", "records", "seasonPerformances",
+            "rpmAvatarUrl", "rpmAvatarPreviewUrl", "rpmAvatarMeta", "records", "recordPoints", "seasonPerformances",
             "xp", "levelName", "medals", "followers", "following", "achievements", "favoriteSurface",
             "preferredTrainingTime", "weeklySessions", "totalDistance", "bestPerformance", "lastActivityDate", "streakDays",
             "bio", "friends", "badges", "competitionsCount", "challengesCount", "rankGlobal",
@@ -123,7 +212,7 @@ exports.updateProfile = async (req, res) => {
             "weeklySessions",
         ]);
 
-        const mergeableMaps = new Set(["records", "seasonPerformances"]);
+        const mergeableMaps = new Set(["records", "recordPoints", "seasonPerformances"]);
         const dateFields = new Set(["birthDate"]);
 
         const user = await User.findById(req.user.id).select("-passwordHash -rpmUserToken");
@@ -232,7 +321,7 @@ exports.updatePerformances = async (req, res) => {
 exports.getPerformanceTimeline = async (req, res) => {
     try {
         const { discipline } = req.query;
-        const user = await User.findById(req.user.id).select("performanceTimeline");
+        const user = await User.findById(req.user.id).select("performanceTimeline ffaMergedByEvent ffaResultsByYear");
         if (!user) {
             return res.status(404).json({ message: "Utilisateur non trouvé" });
         }
@@ -245,9 +334,67 @@ exports.getPerformanceTimeline = async (req, res) => {
             })
             .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
+        // fallback vers ffaResultsByYear (base brute) puis ffaMergedByEvent si aucune timeline n'est présente
+        if (timeline.length === 0) {
+            if (user.ffaResultsByYear) {
+                const built = buildPerformancePoints(user.ffaResultsByYear);
+                const filtered = normalized
+                    ? built.filter((p) => normalizeDiscipline(p.discipline) === normalized)
+                    : built;
+                if (filtered.length > 0) {
+                    return res.json(filtered);
+                }
+            }
+
+            if (user.ffaMergedByEvent) {
+                const timelines = buildFfaTimelines(user.ffaMergedByEvent);
+                const fallback = normalized ? timelines[discipline] || [] : Object.values(timelines).flat();
+                if (fallback.length > 0) {
+                    return res.json(fallback);
+                }
+            }
+        }
+
         res.json(timeline);
     } catch (error) {
         console.error("Erreur récupération timeline:", error);
+        res.status(500).json({ message: "Erreur serveur", error });
+    }
+};
+
+// 🔹 GET /api/user/ffa/performance-timeline
+exports.getFfaPerformanceTimeline = async (req, res) => {
+    try {
+        const { discipline } = req.query;
+        const user = await User.findById(req.user.id).select("ffaMergedByEvent ffaResultsByYear");
+        if (!user) {
+            return res.status(404).json({ message: "Utilisateur non trouvé" });
+        }
+
+        // Priorité : ffaResultsByYear -> buildPerformancePoints
+        if (user.ffaResultsByYear) {
+            const built = buildPerformancePoints(user.ffaResultsByYear);
+            const normalized = discipline ? normalizeDiscipline(discipline) : null;
+            const filtered = normalized
+                ? built.filter((p) => normalizeDiscipline(p.discipline) === normalized)
+                : built;
+            if (filtered.length > 0) {
+                return res.json(filtered);
+            }
+        }
+
+        // Fallback ancien format ffaMergedByEvent
+        if (user.ffaMergedByEvent) {
+            const timelines = buildFfaTimelines(user.ffaMergedByEvent);
+            if (discipline) {
+                return res.json(timelines[discipline] || []);
+            }
+            return res.json(timelines);
+        }
+
+        return res.json([]);
+    } catch (error) {
+        console.error("Erreur récupération timeline FFA:", error);
         res.status(500).json({ message: "Erreur serveur", error });
     }
 };
@@ -296,8 +443,8 @@ exports.addPerformanceTimelinePoint = async (req, res) => {
 
 exports.updateRecords = async (req, res) => {
     try {
-        const { records, seasonPerformances } = req.body || {};
-        if (!records && !seasonPerformances) {
+        const { records, recordPoints, seasonPerformances } = req.body || {};
+        if (!records && !recordPoints && !seasonPerformances) {
             return res.status(400).json({ message: "Aucune donnée à mettre à jour" });
         }
 
@@ -310,6 +457,10 @@ exports.updateRecords = async (req, res) => {
             user.records = sanitizeMapMerge(user.records, records);
         }
 
+        if (recordPoints && typeof recordPoints === "object" && !Array.isArray(recordPoints)) {
+            user.recordPoints = sanitizeMapMerge(user.recordPoints, recordPoints);
+        }
+
         if (seasonPerformances && typeof seasonPerformances === "object" && !Array.isArray(seasonPerformances)) {
             user.seasonPerformances = sanitizeMapMerge(user.seasonPerformances, seasonPerformances);
         }
@@ -319,6 +470,7 @@ exports.updateRecords = async (req, res) => {
         res.json({
             message: "Performances mises à jour",
             records: user.records,
+            recordPoints: user.recordPoints,
             seasonPerformances: user.seasonPerformances,
         });
     } catch (error) {
@@ -375,8 +527,14 @@ exports.getUserById = async (req, res) => {
             return res.status(403).json({ message: "Ce profil est privé." });
         }
 
-        const payload = user.toObject();
+        const payload = user.toObject({ flattenMaps: true });
+        payload.records = payload.records || {};
+        payload.recordPoints = payload.recordPoints || {};
+        payload.seasonPerformances = payload.seasonPerformances || {};
+        payload.performances = payload.performances || [];
+        payload.performanceTimeline = payload.performanceTimeline || [];
         payload.relationship = buildRelationshipPayload(user, viewerId);
+
         res.json(payload);
     } catch (error) {
         console.error("Erreur getUserById:", error);
