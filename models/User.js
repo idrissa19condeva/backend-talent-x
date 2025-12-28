@@ -48,8 +48,10 @@ const userSchema = new mongoose.Schema(
         photoUrl: { type: String },
 
         // 🔹 Informations sportives
+        mainDisciplineFamily: { type: String, required: false },
         mainDiscipline: { type: String, required: false },
         otherDisciplines: [{ type: String }],
+        licenseNumber: { type: String, required: false, trim: true },
         epreuve: [{ type: Map, of: [String] }], // ex: [ { "100m": "12.34s" } ]
         club: { type: String },
         level: { type: String, enum: ["beginner", "intermediate", "advanced", "pro"], default: "beginner" },

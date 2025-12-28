@@ -22,17 +22,35 @@ const parseWind = (raw) => {
     return Number.isFinite(value) ? value : undefined;
 };
 
+// Vérifie si un email existe déjà (pré-inscription)
+exports.checkEmail = async (req, res) => {
+    try {
+        const email = String(req.query.email || "").trim().toLowerCase();
+        if (!email) {
+            return res.status(400).json({ message: "Email requis" });
+        }
+        const existing = await User.findOne({ email: { $regex: new RegExp(`^${email}$`, "i") } }).select("_id");
+        return res.json({ exists: Boolean(existing) });
+    } catch (error) {
+        console.error("checkEmail error", error);
+        return res.status(500).json({ message: "Erreur lors de la vérification" });
+    }
+};
+
 // 🧾 Inscription
 exports.signup = async (req, res) => {
     try {
-        const { firstName, lastName, email, password, birthDate, gender, role } = req.body;
+        const { firstName, lastName, email, password, birthDate, gender, role, mainDisciplineFamily, mainDiscipline, licenseNumber } = req.body;
 
         if (!firstName || !lastName || !email || !password || !birthDate || !gender || !role) {
             return res.status(400).json({ message: "Tous les champs sont requis" });
         }
 
-        const parsedBirthDate = new Date(birthDate);
-        if (Number.isNaN(parsedBirthDate.getTime())) {
+        const parsedBirthDateParts = String(birthDate || "").split("-").map((v) => Number(v));
+        const parsedBirthDate = parsedBirthDateParts.length === 3
+            ? new Date(Date.UTC(parsedBirthDateParts[0], parsedBirthDateParts[1] - 1, parsedBirthDateParts[2]))
+            : new Date(birthDate);
+        if (!birthDate || Number.isNaN(parsedBirthDate.getTime())) {
             return res.status(400).json({ message: "Date de naissance invalide" });
         }
 
@@ -56,6 +74,9 @@ exports.signup = async (req, res) => {
             birthDate: parsedBirthDate,
             gender,
             role,
+            mainDisciplineFamily: mainDisciplineFamily || undefined,
+            mainDiscipline: mainDiscipline || undefined,
+            licenseNumber: licenseNumber || undefined,
         });
 
         await user.save();
@@ -220,6 +241,9 @@ exports.signup = async (req, res) => {
                 recordPoints: user.recordPoints,
                 performances: user.performances,
                 performanceTimeline: user.performanceTimeline,
+                mainDiscipline: user.mainDiscipline,
+                mainDisciplineFamily: user.mainDisciplineFamily,
+                licenseNumber: user.licenseNumber,
             },
         });
     } catch (err) {
