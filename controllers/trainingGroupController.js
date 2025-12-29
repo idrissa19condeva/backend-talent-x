@@ -3,6 +3,7 @@ const User = require("../models/User");
 
 const OWNER_POPULATION = { path: "owner", select: "fullName username photoUrl" };
 const MEMBER_POPULATION = { path: "members.user", select: "fullName username photoUrl" };
+const REQUEST_POPULATION = { path: "joinRequests.user", select: "fullName username photoUrl" };
 
 const toStringId = (value) => {
     if (!value) return undefined;
@@ -12,12 +13,32 @@ const toStringId = (value) => {
 };
 
 const formatGroup = (group, currentUserId, options = {}) => {
-    const { includeMembers = false } = options;
+    const { includeMembers = false, includePendingRequests = false } = options;
     const members = group.members || [];
     const ownerId = toStringId(group.owner);
     const isMember = Boolean(
         currentUserId && (ownerId === currentUserId || members.some((member) => toStringId(member.user) === currentUserId))
     );
+    const pendingRequests = Array.isArray(group.joinRequests) ? group.joinRequests : [];
+    const hasPendingRequest = Boolean(
+        currentUserId && pendingRequests.some((request) => toStringId(request.user) === currentUserId)
+    );
+
+    const mappedRequests = includePendingRequests
+        ? pendingRequests.map((request) => {
+            const user = request.user || {};
+            if (typeof user === "string") {
+                return { id: user, requestedAt: request.requestedAt };
+            }
+            return {
+                id: user._id?.toString() || user.id || toStringId(user),
+                fullName: user.fullName,
+                username: user.username,
+                photoUrl: user.photoUrl,
+                requestedAt: request.requestedAt,
+            };
+        })
+        : undefined;
 
     const mappedMembers = includeMembers
         ? members.map((member) => {
@@ -42,8 +63,11 @@ const formatGroup = (group, currentUserId, options = {}) => {
         owner: group.owner,
         membersCount: members.length,
         isMember,
+        hasPendingRequest,
+        pendingRequestsCount: includePendingRequests ? pendingRequests.length : undefined,
         createdAt: group.createdAt,
         members: mappedMembers,
+        pendingRequests: mappedRequests,
     };
 };
 
@@ -98,7 +122,9 @@ exports.listMyGroups = async (req, res) => {
         })
             .sort({ name: 1 })
             .populate(OWNER_POPULATION);
-        const payload = groups.map((group) => formatGroup(group, req.user.id, { includeMembers: true }));
+        const payload = groups.map((group) =>
+            formatGroup(group, req.user.id, { includeMembers: true, includePendingRequests: true })
+        );
         res.json(payload);
     } catch (error) {
         console.error("Erreur liste groupes:", error);
@@ -110,7 +136,8 @@ exports.getGroup = async (req, res) => {
     try {
         const group = await TrainingGroup.findById(req.params.id)
             .populate(OWNER_POPULATION)
-            .populate(MEMBER_POPULATION);
+            .populate(MEMBER_POPULATION)
+            .populate(REQUEST_POPULATION);
         if (!group) {
             return res.status(404).json({ message: "Groupe introuvable" });
         }
@@ -118,11 +145,14 @@ exports.getGroup = async (req, res) => {
         const userId = req.user.id;
         const ownerId = toStringId(group.owner);
         const isMember = ownerId === userId || group.members?.some((member) => toStringId(member.user) === userId);
-        if (!isMember) {
-            return res.status(403).json({ message: "Vous n'avez pas accès à ce groupe" });
-        }
 
-        res.json(formatGroup(group, userId, { includeMembers: true }));
+        // Allow public read: return group info but only expose member list to members/owner.
+        res.json(
+            formatGroup(group, userId, {
+                includeMembers: isMember,
+                includePendingRequests: userId === ownerId,
+            }),
+        );
     } catch (error) {
         console.error("Erreur récupération groupe:", error);
         res.status(500).json({ message: "Impossible de récupérer ce groupe" });
@@ -138,7 +168,8 @@ exports.updateGroup = async (req, res) => {
 
         const group = await TrainingGroup.findById(req.params.id)
             .populate(OWNER_POPULATION)
-            .populate(MEMBER_POPULATION);
+            .populate(MEMBER_POPULATION)
+            .populate(REQUEST_POPULATION);
         if (!group) {
             return res.status(404).json({ message: "Groupe introuvable" });
         }
@@ -181,11 +212,17 @@ exports.joinGroup = async (req, res) => {
             return res.status(400).json({ message: "Vous faites déjà partie de ce groupe" });
         }
 
-        group.members.push({ user: userId, joinedAt: new Date() });
+        const alreadyRequested = group.joinRequests?.some((reqItem) => toStringId(reqItem.user) === userId);
+        if (alreadyRequested) {
+            return res.status(400).json({ message: "Demande déjà envoyée" });
+        }
+
+        group.joinRequests = group.joinRequests || [];
+        group.joinRequests.push({ user: userId, requestedAt: new Date() });
         await group.save();
         await group.populate(OWNER_POPULATION);
 
-        res.json(formatGroup(group, userId));
+        res.status(202).json({ message: "Demande envoyée au coach", ...formatGroup(group, userId) });
     } catch (error) {
         console.error("Erreur rejoindre groupe:", error);
         res.status(500).json({ message: "Impossible de rejoindre ce groupe" });
@@ -231,6 +268,7 @@ exports.addMember = async (req, res) => {
         await group.save();
         await group.populate(OWNER_POPULATION);
         await group.populate(MEMBER_POPULATION);
+        await group.populate(REQUEST_POPULATION);
 
         res.json(formatGroup(group, requesterId, { includeMembers: true }));
     } catch (error) {
@@ -273,10 +311,100 @@ exports.removeMember = async (req, res) => {
         await group.save();
         await group.populate(OWNER_POPULATION);
         await group.populate(MEMBER_POPULATION);
+        await group.populate(REQUEST_POPULATION);
 
         res.json(formatGroup(group, requesterId, { includeMembers: true }));
     } catch (error) {
         console.error("Erreur suppression membre groupe:", error);
         res.status(500).json({ message: "Impossible de retirer ce membre" });
+    }
+};
+
+exports.acceptJoinRequest = async (req, res) => {
+    try {
+        const group = await TrainingGroup.findById(req.params.id)
+            .populate(OWNER_POPULATION)
+            .populate(MEMBER_POPULATION)
+            .populate(REQUEST_POPULATION);
+        if (!group) {
+            return res.status(404).json({ message: "Groupe introuvable" });
+        }
+
+        const requesterId = req.user.id;
+        const ownerId = toStringId(group.owner);
+        if (ownerId !== requesterId) {
+            return res.status(403).json({ message: "Seul le créateur du groupe peut valider" });
+        }
+
+        const targetUserId = req.params.userId?.toString().trim();
+        if (!targetUserId) {
+            return res.status(400).json({ message: "Athlète requis" });
+        }
+
+        const alreadyMember = group.members?.some((member) => toStringId(member.user) === targetUserId);
+        if (alreadyMember) {
+            group.joinRequests = group.joinRequests?.filter((reqItem) => toStringId(reqItem.user) !== targetUserId) || [];
+            await group.save();
+            await group.populate(REQUEST_POPULATION);
+            return res.json(
+                formatGroup(group, requesterId, { includeMembers: true, includePendingRequests: true }),
+            );
+        }
+
+        const pendingIndex = group.joinRequests?.findIndex((reqItem) => toStringId(reqItem.user) === targetUserId) ?? -1;
+        if (pendingIndex === -1) {
+            return res.status(404).json({ message: "Demande introuvable" });
+        }
+
+        group.members.push({ user: targetUserId, joinedAt: new Date() });
+        group.joinRequests.splice(pendingIndex, 1);
+        await group.save();
+        await group.populate(OWNER_POPULATION);
+        await group.populate(MEMBER_POPULATION);
+        await group.populate(REQUEST_POPULATION);
+
+        res.json(formatGroup(group, requesterId, { includeMembers: true, includePendingRequests: true }));
+    } catch (error) {
+        console.error("Erreur validation demande:", error);
+        res.status(500).json({ message: "Impossible de valider la demande" });
+    }
+};
+
+exports.rejectJoinRequest = async (req, res) => {
+    try {
+        const group = await TrainingGroup.findById(req.params.id)
+            .populate(OWNER_POPULATION)
+            .populate(MEMBER_POPULATION)
+            .populate(REQUEST_POPULATION);
+        if (!group) {
+            return res.status(404).json({ message: "Groupe introuvable" });
+        }
+
+        const requesterId = req.user.id;
+        const ownerId = toStringId(group.owner);
+        if (ownerId !== requesterId) {
+            return res.status(403).json({ message: "Seul le créateur du groupe peut refuser" });
+        }
+
+        const targetUserId = req.params.userId?.toString().trim();
+        if (!targetUserId) {
+            return res.status(400).json({ message: "Athlète requis" });
+        }
+
+        const pendingIndex = group.joinRequests?.findIndex((reqItem) => toStringId(reqItem.user) === targetUserId) ?? -1;
+        if (pendingIndex === -1) {
+            return res.status(404).json({ message: "Demande introuvable" });
+        }
+
+        group.joinRequests.splice(pendingIndex, 1);
+        await group.save();
+        await group.populate(OWNER_POPULATION);
+        await group.populate(MEMBER_POPULATION);
+        await group.populate(REQUEST_POPULATION);
+
+        res.json(formatGroup(group, requesterId, { includeMembers: true, includePendingRequests: true }));
+    } catch (error) {
+        console.error("Erreur refus demande:", error);
+        res.status(500).json({ message: "Impossible de refuser la demande" });
     }
 };

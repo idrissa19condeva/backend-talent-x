@@ -28,5 +28,6 @@ router.post("/:id/friend-request", auth, userController.sendFriendRequest);
 router.post("/:id/friend-request/respond", auth, userController.respondFriendRequest);
 router.delete("/:id/friend", auth, userController.removeFriend);
 router.get("/:id", auth, userController.getUserById);
+router.delete("/delete", auth, userController.deleteAccount);
 
 module.exports = router;

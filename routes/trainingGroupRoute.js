@@ -12,6 +12,8 @@ router.get("/:id/sessions", auth, trainingController.listGroupSessions);
 router.get("/:id", auth, trainingGroupController.getGroup);
 router.patch("/:id", auth, trainingGroupController.updateGroup);
 router.post("/:id/join", auth, trainingGroupController.joinGroup);
+router.post("/:id/requests/:userId/accept", auth, trainingGroupController.acceptJoinRequest);
+router.delete("/:id/requests/:userId", auth, trainingGroupController.rejectJoinRequest);
 router.post("/:id/sessions", auth, trainingController.attachSessionToGroup);
 router.delete("/:id/sessions/:sessionId", auth, trainingController.detachSessionFromGroup);
 router.post("/:id/members", auth, trainingGroupController.addMember);

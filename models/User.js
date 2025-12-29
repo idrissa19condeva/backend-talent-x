@@ -45,6 +45,9 @@ const userSchema = new mongoose.Schema(
         bodyWeightKg: { type: Number, min: 0 },
         maxMuscuKg: { type: Number, min: 0 },
         maxChariotKg: { type: Number, min: 0 },
+        phone: { type: String, trim: true },
+        phoneNumber: { type: String, trim: true },
+        trainingAddress: { type: String, trim: true },
         photoUrl: { type: String },
 
         // 🔹 Informations sportives

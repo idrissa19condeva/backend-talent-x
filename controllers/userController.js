@@ -214,6 +214,28 @@ const buildRelationshipPayload = (userDoc, viewerId) => {
     };
 };
 
+// 🔹 DELETE /api/user/delete
+exports.deleteAccount = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({ message: "Utilisateur non authentifié" });
+        }
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ message: "Utilisateur non trouvé" });
+        }
+
+        await User.deleteOne({ _id: userId });
+
+        return res.json({ message: "Compte supprimé" });
+    } catch (error) {
+        console.error("Erreur deleteAccount:", error);
+        return res.status(500).json({ message: "Impossible de supprimer le compte maintenant" });
+    }
+};
+
 // 🔹 GET /api/user/me
 exports.getProfile = async (req, res) => {
     try {
@@ -243,6 +265,7 @@ exports.updateProfile = async (req, res) => {
     try {
         const allowedFields = [
             "username", "gender", "birthDate", "country", "city", "language", "photoUrl",
+            "phone", "phoneNumber", "trainingAddress",
             "mainDiscipline", "otherDisciplines", "club", "level", "goals",
             "dominantLeg", "favoriteCoach", "isProfilePublic", "notificationsEnabled", "autoSharePerformance",
             "theme", "instagram", "strava", "tiktok", "website", "category", "performances",

@@ -24,6 +24,15 @@ const trainingGroupSchema = new mongoose.Schema(
         description: { type: String, trim: true, maxlength: 240 },
         owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
         members: { type: [trainingGroupMemberSchema], default: [] },
+        joinRequests: {
+            type: [
+                {
+                    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+                    requestedAt: { type: Date, default: Date.now },
+                },
+            ],
+            default: [],
+        },
     },
     { timestamps: true }
 );
@@ -48,6 +57,12 @@ trainingGroupSchema.set("toJSON", {
             ret.members = ret.members.map((member) => ({
                 user: member.user?.toString() || member.user,
                 joinedAt: member.joinedAt,
+            }));
+        }
+        if (Array.isArray(ret.joinRequests)) {
+            ret.joinRequests = ret.joinRequests.map((req) => ({
+                user: req.user?.toString() || req.user,
+                requestedAt: req.requestedAt,
             }));
         }
         return ret;
