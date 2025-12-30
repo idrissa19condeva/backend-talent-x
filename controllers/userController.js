@@ -860,14 +860,16 @@ exports.removeFriend = async (req, res) => {
 // Permet à l'utilisateur de modifier son mot de passe en fournissant le mot de passe actuel.
 exports.updateCredentials = async (req, res) => {
     try {
-        const { currentPassword, newPassword } = req.body || {};
+        const { currentPassword, newPassword, newEmail } = req.body || {};
 
-        if (!newPassword) {
+        if (!newPassword && !newEmail) {
             return res.status(400).json({ message: "Aucune modification demandée" });
         }
 
         // Récupère explicitement le hash pour vérifier le mot de passe actuel (et laisse le reste par défaut).
         const user = await User.findById(req.user.id).select("+passwordHash");
+        console.log(user.email);
+
         if (!user) {
             return res.status(404).json({ message: "Utilisateur non trouvé" });
         }
@@ -894,15 +896,32 @@ exports.updateCredentials = async (req, res) => {
             return res.status(401).json({ message: "Mot de passe actuel incorrect" });
         }
 
-        const isSameAsOld = await bcrypt.compare(String(newPassword), String(user.passwordHash));
-        if (isSameAsOld) {
-            return res.status(400).json({ message: "Le nouveau mot de passe doit être différent de l'actuel" });
+        if (newPassword) {
+            const isSameAsOld = await bcrypt.compare(String(newPassword), String(user.passwordHash));
+            if (isSameAsOld) {
+                return res.status(400).json({ message: "Le nouveau mot de passe doit être différent de l'actuel" });
+            }
+            if (String(newPassword).length < 8) {
+                return res.status(400).json({ message: "Le nouveau mot de passe doit contenir au moins 8 caractères" });
+            }
+            const hashed = await bcrypt.hash(String(newPassword), 10);
+            user.passwordHash = hashed;
         }
-        if (String(newPassword).length < 8) {
-            return res.status(400).json({ message: "Le nouveau mot de passe doit contenir au moins 8 caractères" });
+
+        if (newEmail) {
+            const normalized = String(newEmail).trim().toLowerCase();
+            if (!normalized.includes("@") || normalized.length < 5) {
+                return res.status(400).json({ message: "Email invalide" });
+            }
+            if (normalized === String(user.email || "").toLowerCase()) {
+                return res.status(400).json({ message: "Le nouvel email doit être différent de l'actuel" });
+            }
+            const emailInUse = await User.findOne({ email: normalized, _id: { $ne: user._id } }).select("_id");
+            if (emailInUse) {
+                return res.status(400).json({ message: "Cet email est déjà utilisé" });
+            }
+            user.email = normalized;
         }
-        const hashed = await bcrypt.hash(String(newPassword), 10);
-        user.passwordHash = hashed;
 
         await user.save();
 
