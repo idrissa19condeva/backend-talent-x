@@ -4,8 +4,21 @@ const multer = require("multer");
 const auth = require("../midlewares/authMiddleware");
 const userController = require("../controllers/userController");
 
-// Config Multer
-const upload = multer({ storage: multer.memoryStorage() });
+// Config Multer (avatar)
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 6 * 1024 * 1024, // 6MB
+    },
+    fileFilter: (_req, file, cb) => {
+        const isImage = Boolean(file?.mimetype) && String(file.mimetype).toLowerCase().startsWith("image/");
+        if (!isImage) {
+            cb(new Error("Format de fichier non supporté"));
+            return;
+        }
+        cb(null, true);
+    },
+});
 
 // Routes
 router.get("/me", auth, userController.getProfile);
@@ -23,6 +36,17 @@ router.put("/records", auth, userController.updateRecords);
 router.post("/:id/friend-request", auth, userController.sendFriendRequest);
 router.post("/:id/friend-request/respond", auth, userController.respondFriendRequest);
 router.delete("/:id/friend", auth, userController.removeFriend);
+
+// Notifications (inbox)
+router.get("/me/notifications", auth, userController.listMyNotifications);
+router.delete("/me/notifications", auth, userController.clearMyNotifications);
+router.delete("/me/notifications/:notificationId", auth, userController.deleteMyNotification);
+
+// Push notifications (Expo)
+router.post("/me/push-token", auth, userController.registerPushToken);
+router.delete("/me/push-token", auth, userController.unregisterPushToken);
+router.post("/me/push-test", auth, userController.sendMyTestPush);
+
 router.get("/:id", auth, userController.getUserById);
 router.delete("/delete", auth, userController.deleteAccount);
 

@@ -1,16 +1,154 @@
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { fetchFfaByName } = require("../services/ffaService");
+const EmailVerification = require("../models/EmailVerification");
+const { normalizePersonName } = require("../utils/nameFormat");
+const emailService = require("../services/emailService");
 
-const ACCESS_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
-const REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || "30d";
-const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
+const ACCESS_EXPIRES_IN = () => process.env.JWT_EXPIRES_IN || "7d";
+const REFRESH_EXPIRES_IN = () => process.env.JWT_REFRESH_EXPIRES_IN || "30d";
+// Read secrets lazily at call-time to avoid import-order issues with dotenv.
+const REFRESH_SECRET = () => process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
+const EMAIL_CODE_TTL_MINUTES = Number(process.env.EMAIL_CODE_TTL_MINUTES || 10);
+const EMAIL_CODE_MAX_ATTEMPTS = Number(process.env.EMAIL_CODE_MAX_ATTEMPTS || 5);
+const PASSWORD_RESET_CODE_TTL_MINUTES = Number(process.env.PASSWORD_RESET_CODE_TTL_MINUTES || 10);
+const PASSWORD_RESET_CODE_MAX_ATTEMPTS = Number(process.env.PASSWORD_RESET_CODE_MAX_ATTEMPTS || 5);
 
-const signAccessToken = (userId) => jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: ACCESS_EXPIRES_IN });
-const signRefreshToken = (userId) => jwt.sign({ id: userId }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRES_IN });
+const RESET_CODE_SECRET = () => process.env.PASSWORD_RESET_CODE_SECRET || process.env.JWT_SECRET || "tracknfield";
+const hashResetCode = (code) => crypto.createHash("sha256").update(`${String(code || "").trim()}:${RESET_CODE_SECRET()}`).digest("hex");
+
+const signAccessToken = (userId) => jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: ACCESS_EXPIRES_IN() });
+const signRefreshToken = (userId) => jwt.sign({ id: userId }, REFRESH_SECRET(), { expiresIn: REFRESH_EXPIRES_IN() });
 const DEFAULT_FFA_YEARS = []; // vide => on récupère toutes les années disponibles pour l'athlète
 const sanitizeKey = (value = "") => value.replace(/\./g, "_");
+const generateEmailCode = () => String(Math.floor(100000 + Math.random() * 900000));
+
+// 🔐 Envoie un code reset mot de passe par email (si le compte existe)
+exports.requestPasswordResetCode = async (req, res) => {
+    try {
+        const email = String(req.body.email || "").trim().toLowerCase();
+        if (!email) {
+            return res.status(400).json({ message: "Email requis" });
+        }
+
+        // Toujours répondre OK pour éviter de leak l'existence d'un compte.
+        const user = await User.findOne({ email }).select("+passwordResetCodeHash +passwordResetExpiresAt +passwordResetAttempts +passwordResetRequestedAt");
+        if (user) {
+            const code = generateEmailCode();
+            user.passwordResetCodeHash = hashResetCode(code);
+            user.passwordResetExpiresAt = new Date(Date.now() + PASSWORD_RESET_CODE_TTL_MINUTES * 60 * 1000);
+            user.passwordResetAttempts = 0;
+            user.passwordResetRequestedAt = new Date();
+            await user.save();
+
+            try {
+                if (typeof emailService.sendPasswordResetCode === "function") {
+                    await emailService.sendPasswordResetCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
+                } else {
+                    await emailService.sendVerificationCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
+                }
+            } catch (mailErr) {
+                console.error("sendPasswordResetCode error", mailErr);
+            }
+        }
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("requestPasswordResetCode error", error);
+        return res.status(500).json({ message: "Impossible d'envoyer le code" });
+    }
+};
+
+// 🔐 Vérifie un code reset mot de passe
+exports.verifyPasswordResetCode = async (req, res) => {
+    try {
+        const email = String(req.body.email || "").trim().toLowerCase();
+        const code = String(req.body.code || "").trim();
+
+        if (!email || !code) {
+            return res.status(400).json({ message: "Email et code requis" });
+        }
+
+        const user = await User.findOne({ email }).select("+passwordResetCodeHash +passwordResetExpiresAt +passwordResetAttempts");
+        if (!user?.passwordResetCodeHash || !user?.passwordResetExpiresAt) {
+            return res.status(400).json({ message: "Code invalide ou expiré" });
+        }
+
+        if ((user.passwordResetAttempts || 0) >= PASSWORD_RESET_CODE_MAX_ATTEMPTS) {
+            return res.status(429).json({ message: "Trop de tentatives, redemande un code" });
+        }
+
+        if (user.passwordResetExpiresAt.getTime() < Date.now()) {
+            return res.status(400).json({ message: "Code expiré, redemande un nouveau code" });
+        }
+
+        if (hashResetCode(code) !== user.passwordResetCodeHash) {
+            user.passwordResetAttempts = (user.passwordResetAttempts || 0) + 1;
+            await user.save();
+            const remaining = Math.max(PASSWORD_RESET_CODE_MAX_ATTEMPTS - (user.passwordResetAttempts || 0), 0);
+            return res.status(400).json({ message: "Code incorrect", remainingAttempts: remaining });
+        }
+
+        user.passwordResetAttempts = 0;
+        await user.save();
+
+        return res.json({ verified: true });
+    } catch (error) {
+        console.error("verifyPasswordResetCode error", error);
+        return res.status(500).json({ message: "Impossible de vérifier le code" });
+    }
+};
+
+// 🔐 Confirme le reset mot de passe (code + nouveau mdp)
+exports.confirmPasswordReset = async (req, res) => {
+    try {
+        const email = String(req.body.email || "").trim().toLowerCase();
+        const code = String(req.body.code || "").trim();
+        const newPassword = String(req.body.newPassword || "");
+
+        if (!email || !code || !newPassword) {
+            return res.status(400).json({ message: "Email, code et nouveau mot de passe requis" });
+        }
+
+        if (newPassword.trim().length < 6) {
+            return res.status(400).json({ message: "Mot de passe trop court (6 caractères min.)" });
+        }
+
+        const user = await User.findOne({ email }).select("+passwordResetCodeHash +passwordResetExpiresAt +passwordResetAttempts");
+        if (!user?.passwordResetCodeHash || !user?.passwordResetExpiresAt) {
+            return res.status(400).json({ message: "Code invalide ou expiré" });
+        }
+
+        if ((user.passwordResetAttempts || 0) >= PASSWORD_RESET_CODE_MAX_ATTEMPTS) {
+            return res.status(429).json({ message: "Trop de tentatives, redemande un code" });
+        }
+
+        if (user.passwordResetExpiresAt.getTime() < Date.now()) {
+            return res.status(400).json({ message: "Code expiré, redemande un nouveau code" });
+        }
+
+        if (hashResetCode(code) !== user.passwordResetCodeHash) {
+            user.passwordResetAttempts = (user.passwordResetAttempts || 0) + 1;
+            await user.save();
+            const remaining = Math.max(PASSWORD_RESET_CODE_MAX_ATTEMPTS - (user.passwordResetAttempts || 0), 0);
+            return res.status(400).json({ message: "Code incorrect", remainingAttempts: remaining });
+        }
+
+        user.passwordHash = await bcrypt.hash(newPassword, 10);
+        user.passwordResetCodeHash = undefined;
+        user.passwordResetExpiresAt = undefined;
+        user.passwordResetAttempts = 0;
+        user.passwordResetRequestedAt = undefined;
+        await user.save();
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("confirmPasswordReset error", error);
+        return res.status(500).json({ message: "Impossible de réinitialiser le mot de passe" });
+    }
+};
 
 const parseWind = (raw) => {
     if (raw === undefined || raw === null) return undefined;
@@ -37,6 +175,96 @@ exports.checkEmail = async (req, res) => {
     }
 };
 
+// Envoie un code OTP par email
+exports.requestEmailCode = async (req, res) => {
+    try {
+        const email = String(req.body.email || "").trim().toLowerCase();
+        if (!email) {
+            return res.status(400).json({ message: "Email requis" });
+        }
+
+        const existing = await User.findOne({ email }).select("_id");
+        if (existing) {
+            return res.status(400).json({ message: "Email déjà utilisé" });
+        }
+
+        const code = generateEmailCode();
+        const expiresAt = new Date(Date.now() + EMAIL_CODE_TTL_MINUTES * 60 * 1000);
+
+        await EmailVerification.findOneAndUpdate(
+            { email },
+            { email, code, expiresAt, attempts: 0, verifiedAt: null },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
+        );
+
+        try {
+            await emailService.sendVerificationCode(email, code, EMAIL_CODE_TTL_MINUTES);
+        } catch (mailErr) {
+            console.error("sendVerificationCode error", mailErr);
+        }
+
+        return res.json({ ok: true, expiresAt });
+    } catch (error) {
+        console.error("requestEmailCode error", error);
+        return res.status(500).json({ message: "Impossible d'envoyer le code" });
+    }
+};
+
+// Vérifie un code OTP email
+exports.verifyEmailCode = async (req, res) => {
+    try {
+        const email = String(req.body.email || "").trim().toLowerCase();
+        const code = String(req.body.code || "").trim();
+
+        const mask = (value) => {
+            if (!value) return "";
+            if (value.length <= 2) return "**";
+            return `${value.slice(0, 2)}***`;
+        };
+
+        console.info("verifyEmailCode attempt", { email, code: mask(code) });
+
+        if (!email || !code) {
+            return res.status(400).json({ message: "Email et code requis" });
+        }
+
+        const record = await EmailVerification.findOne({ email }).sort({ createdAt: -1 }).exec();
+        if (!record) {
+            console.warn("verifyEmailCode record not found", { email });
+            return res.status(400).json({ message: "Code invalide ou expiré" });
+        }
+
+        if (record.attempts >= EMAIL_CODE_MAX_ATTEMPTS) {
+            console.warn("verifyEmailCode too many attempts", { email, attempts: record.attempts });
+            return res.status(429).json({ message: "Trop de tentatives, redemande un code" });
+        }
+
+        if (record.expiresAt.getTime() < Date.now()) {
+            console.warn("verifyEmailCode expired", { email, expiresAt: record.expiresAt });
+            return res.status(400).json({ message: "Code expiré, redemande un nouveau code" });
+        }
+
+        if (record.code !== code) {
+            record.attempts += 1;
+            await record.save();
+            const remaining = Math.max(EMAIL_CODE_MAX_ATTEMPTS - record.attempts, 0);
+            console.warn("verifyEmailCode mismatch", { email, attempts: record.attempts, remaining });
+            return res.status(400).json({ message: "Code incorrect", remainingAttempts: remaining });
+        }
+
+        record.verifiedAt = new Date();
+        record.attempts = 0;
+        await record.save();
+
+        console.info("verifyEmailCode success", { email, verifiedAt: record.verifiedAt });
+
+        return res.json({ verified: true, verifiedAt: record.verifiedAt });
+    } catch (error) {
+        console.error("verifyEmailCode error", error);
+        return res.status(500).json({ message: "Impossible de vérifier le code" });
+    }
+};
+
 // 🧾 Inscription
 exports.signup = async (req, res) => {
     try {
@@ -44,6 +272,12 @@ exports.signup = async (req, res) => {
 
         if (!firstName || !lastName || !email || !password || !birthDate || !gender || !role) {
             return res.status(400).json({ message: "Tous les champs sont requis" });
+        }
+
+        const normalizedLicense = String(licenseNumber || "").trim();
+        const isCoach = String(role).trim() === "coach";
+        if (!isCoach && !normalizedLicense) {
+            return res.status(400).json({ message: "Le numéro de licence est requis" });
         }
 
         const parsedBirthDateParts = String(birthDate || "").split("-").map((v) => Number(v));
@@ -63,12 +297,25 @@ exports.signup = async (req, res) => {
             return res.status(400).json({ message: "Email déjà utilisé" });
         }
 
+        // Ensure email was verified recently
+        const recentVerification = await EmailVerification.findOne({ email, verifiedAt: { $ne: null } })
+            .sort({ verifiedAt: -1 })
+            .exec();
+
+        if (!recentVerification || Date.now() - recentVerification.verifiedAt.getTime() > EMAIL_CODE_TTL_MINUTES * 60 * 1000) {
+            return res.status(400).json({ message: "Email not verified. Please confirm the code we sent." });
+        }
+
         const hashedPassword = await bcrypt.hash(password, 10);
 
+        const normalizedFirstName = normalizePersonName(firstName);
+        const normalizedLastName = normalizePersonName(lastName);
+        const normalizedFullName = `${normalizedFirstName} ${normalizedLastName}`.trim();
+
         const user = new User({
-            fullName: `${firstName.trim()} ${lastName.trim()}`.trim(),
-            firstName: firstName.trim(),
-            lastName: lastName.trim(),
+            fullName: normalizedFullName,
+            firstName: normalizedFirstName,
+            lastName: normalizedLastName,
             email,
             passwordHash: hashedPassword,
             birthDate: parsedBirthDate,
@@ -76,15 +323,29 @@ exports.signup = async (req, res) => {
             role,
             mainDisciplineFamily: mainDisciplineFamily || undefined,
             mainDiscipline: mainDiscipline || undefined,
-            licenseNumber: licenseNumber || undefined,
+            licenseNumber: isCoach ? undefined : normalizedLicense,
         });
-
-        await user.save();
 
         // Import FFA : enregistre records / performances / timeline pour l'athlète
         if (role === "athlete") {
             try {
-                const ffa = await fetchFfaByName(firstName, lastName, DEFAULT_FFA_YEARS);
+                const ffa = await fetchFfaByName(normalizedFirstName, normalizedLastName, DEFAULT_FFA_YEARS, normalizedLicense);
+
+                if (normalizedLicense) {
+                    if (ffa?.licenseCheckFailed) {
+                        console.warn("FFA signup - licence check failed", { firstName: normalizedFirstName, lastName: normalizedLastName, license: normalizedLicense, actseq: ffa?.actseq });
+                        return res.status(502).json({ message: "Impossible de vérifier le numéro de licence sur la fiche FFA pour le moment" });
+                    }
+                    if (ffa?.licenseVerified === false) {
+                        console.warn("FFA signup - licence mismatch", { firstName: normalizedFirstName, lastName: normalizedLastName, license: normalizedLicense, actseq: ffa?.actseq, licensesFound: ffa?.licensesFound });
+                        return res.status(400).json({ message: "Numéro de licence introuvable sur la fiche FFA pour cet athlète" });
+                    }
+                }
+
+                if (!ffa) {
+                    console.warn("FFA signup - aucun résultat FFA", { firstName: normalizedFirstName, lastName: normalizedLastName });
+                    return res.status(502).json({ message: "Impossible de récupérer la fiche FFA" });
+                }
 
                 const mergedByEvent = {};
                 const safeResultsByYear = {};
@@ -197,30 +458,32 @@ exports.signup = async (req, res) => {
                     }
                 }
 
-                await User.findByIdAndUpdate(
-                    user._id,
-                    {
-                        $set: {
-                            records,
-                            recordPoints,
-                            performances,
-                            performanceTimeline,
-                            ffaResultsByYear: safeResultsByYear,
-                            ffaMergedByEvent: mergedByEvent,
-                        },
-                    },
-                    { new: true },
-                );
-
-                // mets à jour l'instance pour la réponse
+                // hydrate l'instance pour persistance après validations FFA
                 user.records = records;
                 user.recordPoints = recordPoints;
                 user.performances = performances;
-                user.performanceTimeline = performanceTimeline;
+                // Some FFA rows can have missing/blank performance values; Mongoose requires `value`.
+                user.performanceTimeline = (performanceTimeline || [])
+                    .filter((entry) => {
+                        const value = typeof entry?.value === "string" ? entry.value.trim() : "";
+                        const discipline = typeof entry?.discipline === "string" ? entry.discipline.trim() : "";
+                        return Boolean(value) && Boolean(discipline);
+                    })
+                    .map((entry) => ({
+                        ...entry,
+                        value: typeof entry.value === "string" ? entry.value.trim() : entry.value,
+                        discipline:
+                            typeof entry.discipline === "string" ? entry.discipline.trim() : entry.discipline,
+                    }));
+                user.ffaResultsByYear = safeResultsByYear;
+                user.ffaMergedByEvent = mergedByEvent;
             } catch (importErr) {
                 console.warn("FFA signup - échec import/log:", importErr.message);
             }
         }
+
+        // on ne persiste qu'après toutes les validations (FFA incluse)
+        await user.save();
 
         const token = signAccessToken(user._id);
         const refreshToken = signRefreshToken(user._id);
@@ -308,7 +571,7 @@ exports.refresh = async (req, res) => {
 
         let payload;
         try {
-            payload = jwt.verify(refreshToken, REFRESH_SECRET);
+            payload = jwt.verify(refreshToken, REFRESH_SECRET());
         } catch (err) {
             return res.status(401).json({ message: "Refresh token invalide" });
         }

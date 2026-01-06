@@ -1,6 +1,7 @@
 const TrainingSession = require("../models/TrainingSession");
 const TrainingGroup = require("../models/TrainingGroup");
 const User = require("../models/User");
+const TrainingTemplate = require("../models/TrainingTemplate");
 
 const ensureValidDate = (value) => {
     const parsed = value ? new Date(value) : new Date();
@@ -90,9 +91,9 @@ const ensureAutomaticStatusForMany = async (sessions = []) => {
 const hasValidSeries = (series) => Array.isArray(series) && series.length > 0;
 
 const sessionPopulationPaths = [
-    { path: "athleteId", select: "fullName username photoUrl" },
-    { path: "participants.user", select: "fullName username photoUrl" },
-    { path: "participants.addedBy", select: "fullName username photoUrl" },
+    { path: "athleteId", select: "fullName username photoUrl role" },
+    { path: "participants.user", select: "fullName username photoUrl role" },
+    { path: "participants.addedBy", select: "fullName username photoUrl role" },
     { path: "group", select: "name description owner" },
 ];
 
@@ -233,8 +234,102 @@ exports.createSession = async (req, res) => {
         res.status(201).json(session);
     } catch (error) {
         console.error("Erreur création séance:", error);
-        const message = error.message?.includes("Date invalide") ? error.message : "Erreur lors de la création de la séance";
-        res.status(500).json({ message });
+        if (error?.message?.includes("Date invalide")) {
+            return res.status(400).json({ message: "Date invalide" });
+        }
+
+        if (error?.name === "ValidationError") {
+            return res.status(400).json({ message: "Données invalides" });
+        }
+
+        res.status(500).json({ message: "Erreur lors de la création de la séance" });
+    }
+};
+
+exports.createSessionFromTemplate = async (req, res) => {
+    try {
+        const template = await TrainingTemplate.findById(req.params.id);
+        if (!template) {
+            return res.status(404).json({ message: "Template introuvable" });
+        }
+        if (template.ownerId.toString() !== req.user.id) {
+            return res.status(403).json({ message: "Vous n'avez pas accès à ce template" });
+        }
+
+        const { groupId } = req.body;
+        let groupForSession = null;
+
+        if (groupId) {
+            const { group, isOwner } = await resolveGroupAccess(groupId, req.user.id);
+            if (!group) {
+                return res.status(404).json({ message: "Groupe introuvable" });
+            }
+            if (!isOwner) {
+                return res.status(403).json({ message: "Seul le créateur du groupe peut publier une séance" });
+            }
+            groupForSession = group;
+        }
+
+        const normalizedStartTime = normalizeSessionTime(req.body.startTime);
+        const normalizedDuration = normalizeDurationMinutes(req.body.durationMinutes);
+        if (!normalizedStartTime || !normalizedDuration) {
+            return res.status(400).json({ message: "Horaires requis." });
+        }
+
+        const snapshot = {
+            title: template.title,
+            type: template.type,
+            description: template.description,
+            equipment: template.equipment,
+            targetIntensity: template.targetIntensity,
+            series: template.series,
+            seriesRestInterval: template.seriesRestInterval,
+            seriesRestUnit: template.seriesRestUnit,
+            templateId: template._id.toString(),
+            templateVersion: template.version,
+            capturedAt: new Date(),
+        };
+
+        const payload = {
+            athleteId: req.user.id,
+            date: ensureValidDate(req.body.date),
+            startTime: normalizedStartTime,
+            durationMinutes: normalizedDuration,
+            status: req.body.status || "planned",
+
+            // Keep existing API fields populated (mobile/backward compat)
+            type: template.type,
+            title: template.title,
+            place: req.body.place,
+            description: typeof req.body.description === "string" ? req.body.description : template.description,
+            series: template.series,
+            seriesRestInterval: template.seriesRestInterval,
+            seriesRestUnit: template.seriesRestUnit,
+            targetIntensity: template.targetIntensity,
+            equipment: template.equipment,
+            coachNotes: req.body.coachNotes,
+
+            templateId: template._id,
+            templateSnapshot: snapshot,
+        };
+
+        if (groupForSession) {
+            payload.group = groupForSession._id;
+        }
+
+        const session = await TrainingSession.create(payload);
+        await ensureAutomaticStatus(session);
+        await session.populate(sessionPopulationPaths);
+        res.status(201).json(session);
+    } catch (error) {
+        console.error("Erreur création séance depuis template:", error);
+        if (error?.message?.includes("Date invalide")) {
+            return res.status(400).json({ message: "Date invalide" });
+        }
+        if (error?.name === "ValidationError") {
+            return res.status(400).json({ message: "Données invalides" });
+        }
+        res.status(500).json({ message: "Erreur lors de la création de la séance" });
     }
 };
 
@@ -319,25 +414,58 @@ exports.attachSessionToGroup = async (req, res) => {
             return res.status(403).json({ message: "Seul le créateur du groupe peut ajouter une séance" });
         }
 
-        const session = await TrainingSession.findById(sessionId).populate(sessionPopulationPaths);
-        if (!session) {
+        const sourceSession = await TrainingSession.findById(sessionId);
+        if (!sourceSession) {
             return res.status(404).json({ message: "Séance introuvable" });
         }
 
-        if (toStringId(session.athleteId) !== req.user.id) {
+        if (toStringId(sourceSession.athleteId) !== req.user.id) {
             return res.status(403).json({ message: "Vous ne pouvez partager que vos propres séances" });
         }
 
-        if (session.group && toStringId(session.group) !== req.params.id) {
-            return res.status(400).json({ message: "Cette séance est déjà partagée dans un autre groupe" });
+        if (sourceSession.group) {
+            return res.status(400).json({ message: "Cette séance est déjà liée à un groupe" });
         }
 
-        session.group = group._id;
-        await session.save();
-        await ensureAutomaticStatus(session);
-        await session.populate(sessionPopulationPaths);
+        const existingCopy = await TrainingSession.findOne({
+            athleteId: req.user.id,
+            group: group._id,
+            copiedFromSessionId: sourceSession._id,
+        }).populate(sessionPopulationPaths);
 
-        res.json(session);
+        if (existingCopy) {
+            await ensureAutomaticStatus(existingCopy);
+            return res.json(existingCopy);
+        }
+
+        const copyPayload = {
+            athleteId: sourceSession.athleteId,
+            date: sourceSession.date,
+            startTime: sourceSession.startTime,
+            durationMinutes: sourceSession.durationMinutes,
+            type: sourceSession.type,
+            title: sourceSession.title,
+            place: sourceSession.place,
+            description: sourceSession.description,
+            series: sourceSession.series,
+            seriesRestInterval: sourceSession.seriesRestInterval,
+            seriesRestUnit: sourceSession.seriesRestUnit,
+            targetIntensity: sourceSession.targetIntensity,
+            coachNotes: sourceSession.coachNotes,
+            equipment: sourceSession.equipment,
+            status: sourceSession.status || "planned",
+            group: group._id,
+            copiedFromSessionId: sourceSession._id,
+            participants: [],
+            chronos: [],
+            athleteFeedback: undefined,
+        };
+
+        const created = await TrainingSession.create(copyPayload);
+        await ensureAutomaticStatus(created);
+        await created.populate(sessionPopulationPaths);
+
+        res.status(201).json(created);
     } catch (error) {
         console.error("Erreur attachement séance groupe:", error);
         res.status(500).json({ message: "Impossible d'ajouter cette séance au groupe" });
@@ -370,6 +498,14 @@ exports.detachSessionFromGroup = async (req, res) => {
 
         if (!session.group || toStringId(session.group) !== req.params.id) {
             return res.status(400).json({ message: "Cette séance n'est pas partagée dans ce groupe" });
+        }
+
+        const isCopy = Boolean(session.copiedFromSessionId);
+
+        if (isCopy) {
+            const snapshot = typeof session.toJSON === "function" ? session.toJSON() : session;
+            await TrainingSession.deleteOne({ _id: session._id });
+            return res.json(snapshot);
         }
 
         session.group = undefined;

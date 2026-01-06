@@ -17,6 +17,11 @@ const parseDistance = (raw = "") => {
     return Number.isFinite(num) ? num : null;
 };
 
+const normalizeLicense = (value) => {
+    const digits = String(value || "").replace(/\D/g, "");
+    return digits || null;
+};
+
 const classifyMetric = (epreuve, performance) => {
     const label = String(epreuve || "").toLowerCase();
     const perf = String(performance || "").toLowerCase();
@@ -80,12 +85,60 @@ function fetchUrl(targetUrl) {
     });
 }
 
-async function fetchFfaByName(firstName, lastName, years = []) {
+const extractLicensesFromProfile = (html = "") => {
+    // Primary pass: tolerant span/gap between label and digits (allows tags, nbsp, newlines, etc.).
+    const primary = [...html.matchAll(/licen[cs]e[\s\S]{0,80}?(\d{5,})/gi)]
+        .map((m) => normalizeLicense(m[1]))
+        .filter(Boolean);
+    if (primary.length) return Array.from(new Set(primary));
+
+    // Fallback: strip tags and retry on plain text in case the first regex missed.
+    const text = stripTags(html);
+    const fallback = [...text.matchAll(/licen[cs]e[^0-9]{0,20}(\d{5,})/gi)]
+        .map((m) => normalizeLicense(m[1]))
+        .filter(Boolean);
+    return Array.from(new Set(fallback));
+};
+
+async function resolveActseqByLicense(autocomplete = [], normalizedLicense) {
+    if (!normalizedLicense || !Array.isArray(autocomplete) || autocomplete.length === 0) return null;
+
+    const direct = autocomplete.find((entry) => {
+        const lic = normalizeLicense(
+            entry?.license
+            || entry?.licence
+            || entry?.licenceNumber
+            || entry?.licence_number
+            || entry?.lic,
+        );
+        return Boolean(lic && lic === normalizedLicense);
+    });
+    if (direct?.actseq) return direct.actseq;
+
+    for (const entry of autocomplete) {
+        const seq = entry?.actseq;
+        if (!seq) continue;
+        try {
+            const profileHtml = await fetchUrl(new URL(`https://www.athle.fr/athletes/${seq}`));
+            const licenses = extractLicensesFromProfile(profileHtml);
+            console.log("FFA license profile scan", { actseq: seq, provided: normalizedLicense, found: licenses });
+            if (licenses.includes(normalizedLicense)) return seq;
+        } catch (err) {
+            console.warn("FFA license lookup failed for actseq", seq, err.message);
+        }
+    }
+
+    return null;
+}
+
+async function fetchFfaByName(firstName, lastName, years = [], licenseNumber) {
     const trimmedFirst = (firstName || "").trim();
     const trimmedLast = (lastName || "").trim();
     if (!trimmedFirst || !trimmedLast) return null;
 
-    const search = `${encodeURIComponent(trimmedLast)}%${encodeURIComponent(trimmedFirst)}`;
+    const normalizedLicense = normalizeLicense(licenseNumber);
+
+    const search = `${encodeURIComponent(trimmedLast)}%20${encodeURIComponent(trimmedFirst)}`;
     const url = new URL(`https://www.athle.fr/ajax/autocompletion.aspx?mode=1&recherche=${search}`);
 
     const raw = await fetchUrl(url);
@@ -98,11 +151,26 @@ async function fetchFfaByName(firstName, lastName, years = []) {
         console.warn("FFA parse autocomplete failed for search", search);
     }
 
-    const autocomplete = Array.isArray(parsed) ? parsed : null;
-    const actseq = Array.isArray(parsed) && parsed[0]?.actseq;
+    const autocomplete = Array.isArray(parsed) ? parsed : [];
+
+    let actseq = null;
+    if (autocomplete.length) {
+        actseq = normalizedLicense ? await resolveActseqByLicense(autocomplete, normalizedLicense) : null;
+        if (!actseq && normalizedLicense) {
+            console.warn("FFA autocomplete multiple matches, license filter did not match", normalizedLicense);
+        }
+        if (!actseq && !normalizedLicense) {
+            actseq = autocomplete[0]?.actseq;
+        }
+    }
+
     if (!actseq) {
-        console.warn("FFA autocomplete returned no actseq for", trimmedLast, trimmedFirst);
-        return { autocomplete: autocomplete || [], resultsByYear: {}, recordsByEvent: {} };
+        console.warn("FFA autocomplete returned no actseq for", trimmedLast, trimmedFirst, "license", normalizedLicense || "none");
+        const base = { autocomplete, resultsByYear: {}, recordsByEvent: {} };
+        if (normalizedLicense) {
+            return { ...base, licenseVerified: false, licenseCheckFailed: true };
+        }
+        return base;
     }
 
     const getMaxPage = (html) => {
@@ -111,21 +179,64 @@ async function fetchFfaByName(firstName, lastName, years = []) {
         return Math.max(1, ...pages, ...altPages);
     };
 
-    const fetchAvailableYears = async () => {
+    let profileHtmlCache = null;
+    let licenseVerified = normalizedLicense ? false : undefined;
+
+    if (normalizedLicense) {
         try {
-            const profileHtml = await fetchUrl(new URL(`https://www.athle.fr/athletes/${actseq}`));
-            const yearMatches = [...profileHtml.matchAll(/(?:data-value|value)="(\d{4})"/g)].map((m) => m[1]);
-            const distinct = Array.from(new Set(yearMatches));
-            return distinct.sort((a, b) => Number(b) - Number(a));
+            profileHtmlCache = await fetchUrl(new URL(`https://www.athle.fr/athletes/${actseq}`));
+            const licenses = extractLicensesFromProfile(profileHtmlCache);
+            console.log("FFA license check", { actseq, provided: normalizedLicense, found: licenses });
+            const matches = licenses.includes(normalizedLicense);
+            licenseVerified = matches;
+            if (!matches) {
+                console.warn("FFA license mismatch, skip fetching performances", {
+                    actseq,
+                    expected: normalizedLicense,
+                    found: licenses,
+                    source: "profile"
+                });
+                return {
+                    actseq,
+                    autocomplete,
+                    resultsByYear: {},
+                    recordsByEvent: {},
+                    licenseVerified: false,
+                    licensesFound: licenses,
+                };
+            }
         } catch (err) {
-            console.warn("FFA fetch years failed for actseq", actseq, err.message);
-            return [];
+            console.warn("FFA license verification failed for actseq", actseq, err.message);
+            return {
+                actseq,
+                autocomplete,
+                resultsByYear: {},
+                recordsByEvent: {},
+                licenseVerified: false,
+                licenseCheckFailed: true,
+            };
         }
+    }
+
+    const fetchAvailableYears = async (cachedHtml) => {
+        let html = cachedHtml;
+        if (!html) {
+            try {
+                html = await fetchUrl(new URL(`https://www.athle.fr/athletes/${actseq}`));
+            } catch (err) {
+                console.warn("FFA fetch years failed for actseq", actseq, err.message);
+                return [];
+            }
+        }
+
+        const yearMatches = [...html.matchAll(/(?:data-value|value)="(\d{4})"/g)].map((m) => m[1]);
+        const distinct = Array.from(new Set(yearMatches));
+        return distinct.sort((a, b) => Number(b) - Number(a));
     };
 
     let resolvedYears = (years || []).filter(Boolean);
     if (resolvedYears.length === 0) {
-        resolvedYears = await fetchAvailableYears();
+        resolvedYears = await fetchAvailableYears(profileHtmlCache);
     }
     if (resolvedYears.length === 0) {
         resolvedYears = [String(new Date().getFullYear())];
@@ -204,7 +315,7 @@ async function fetchFfaByName(firstName, lastName, years = []) {
         }
     });
 
-    return { actseq, resultsByYear, autocomplete: autocomplete || [], recordsByEvent };
+    return { actseq, resultsByYear, autocomplete, recordsByEvent, licenseVerified };
 }
 
 // --- Normalization helpers to produce frontend-ready data ---

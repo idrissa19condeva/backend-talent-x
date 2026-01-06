@@ -1,6 +1,8 @@
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
+const fetch = require("node-fetch");
 const { buildPerformancePoints } = require("../services/ffaService");
+const sharp = require("sharp");
 
 const sanitizeMapMerge = (source, incoming) => {
     if (!incoming || typeof incoming !== "object") return source;
@@ -97,19 +99,42 @@ const parseFrenchDate = (value, yearHint) => {
 
 const parsePerformanceToNumber = (value) => {
     if (!value) return null;
-    const str = String(value).trim().toLowerCase();
+    const str = String(value)
+        .trim()
+        .toLowerCase()
+        .replace(/\u00a0/g, " ")
+        .replace(/\u2032/g, "'")
+        .replace(/\u2033/g, '"');
 
     // Temps au format 42'59'' (41'16'') -> on extrait un mm'ss'' (priorité au premier dans des parenthèses, sinon le premier trouvé)
     const extractApostropheTime = (s) => {
         // Cherche d'abord dans des parenthèses
         const paren = s.match(/\(([^)]*)\)/);
         const scope = paren ? paren[1] : s;
-        const match = scope.match(/(\d{1,2})['’](\d{1,2})(?:['’]{1,2})?/);
-        if (match) {
-            const m = Number(match[1]);
-            const sec = Number(match[2]);
-            if (Number.isFinite(m) && Number.isFinite(sec)) return m * 60 + sec;
+
+        // mm'ss''cc or mm'ss"cc
+        const mmsscc = scope.match(/(\d{1,2})\s*['’′]\s*(\d{1,2})(?:\s*(?:['’′]{2}|["″])\s*(\d{1,2}))?/);
+        if (mmsscc) {
+            const m = Number(mmsscc[1]);
+            const sec = Number(mmsscc[2]);
+            const centisRaw = mmsscc[3];
+            const centis = centisRaw ? Number(centisRaw) : 0;
+            if (!Number.isFinite(m) || !Number.isFinite(sec) || !Number.isFinite(centis)) return null;
+            const centisFactor = centisRaw && String(centisRaw).length === 1 ? 10 : 100;
+            return m * 60 + sec + centis / centisFactor;
         }
+
+        // ss''cc (sprints)
+        const sscc = scope.match(/\b(\d{1,3})\s*(?:['’′]{2}|["″])\s*(\d{1,2})\b/);
+        if (sscc) {
+            const sec = Number(sscc[1]);
+            const centisRaw = sscc[2];
+            const centis = centisRaw ? Number(centisRaw) : 0;
+            if (!Number.isFinite(sec) || !Number.isFinite(centis)) return null;
+            const centisFactor = centisRaw && String(centisRaw).length === 1 ? 10 : 100;
+            return sec + centis / centisFactor;
+        }
+
         return null;
     };
 
@@ -348,14 +373,183 @@ exports.uploadPhoto = async (req, res) => {
         const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: "Utilisateur non trouvé" });
 
-        user.photoData = req.file.buffer;
-        user.photoContentType = req.file.mimetype || "application/octet-stream";
-        user.photoUrl = `/api/user/photo/${user._id}`;
+        // Resize + compress + normalize format (JPEG)
+        // - guarantees image format
+        // - reduces payload size
+        // - provides stable rendering across platforms
+        const resized = await sharp(req.file.buffer)
+            .rotate()
+            .resize(512, 512, { fit: "cover" })
+            .jpeg({ quality: 82, mozjpeg: true })
+            .toBuffer();
+
+        user.photoData = resized;
+        user.photoContentType = "image/jpeg";
+        user.photoVersion = (user.photoVersion || 0) + 1;
+        user.photoUrl = `/api/user/photo/${user._id}?v=${user.photoVersion}`;
         await user.save();
 
         res.json({ message: "Photo mise à jour", photoUrl: user.photoUrl });
     } catch (error) {
+        console.error("Erreur uploadPhoto:", error);
+        if (error?.message?.includes("Format de fichier")) {
+            return res.status(400).json({ message: error.message });
+        }
+        if (error?.code === "LIMIT_FILE_SIZE") {
+            return res.status(413).json({ message: "Image trop volumineuse (max 6MB)" });
+        }
         res.status(500).json({ message: "Erreur lors de l’upload", error });
+    }
+};
+
+const isExpoPushToken = (token) => {
+    if (typeof token !== "string") return false;
+    const trimmed = token.trim();
+    return trimmed.startsWith("ExponentPushToken[") || trimmed.startsWith("ExpoPushToken[");
+};
+
+const chunkArray = (items = [], size = 100) => {
+    const chunks = [];
+    for (let i = 0; i < items.length; i += size) {
+        chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
+};
+
+const sendExpoPush = async ({ tokens, title, body, data }) => {
+    const messages = (tokens || [])
+        .filter(isExpoPushToken)
+        .map((token) => ({
+            to: token,
+            sound: "default",
+            title: title || "Talent-X",
+            body: body || "",
+            data: data || {},
+        }));
+
+    if (!messages.length) {
+        return { ok: true, tickets: [], message: "No valid Expo push tokens" };
+    }
+
+    const tickets = [];
+    const chunks = chunkArray(messages, 100);
+
+    for (const chunk of chunks) {
+        const response = await fetch("https://exp.host/--/api/v2/push/send", {
+            method: "POST",
+            headers: {
+                Accept: "application/json",
+                "Accept-Encoding": "gzip, deflate",
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(chunk),
+        });
+
+        const json = await response.json().catch(() => null);
+        if (!response.ok) {
+            const message = json?.errors?.[0]?.message || json?.message || `Expo push error (${response.status})`;
+            throw new Error(message);
+        }
+
+        const chunkTickets = json?.data;
+        if (Array.isArray(chunkTickets)) {
+            tickets.push(...chunkTickets);
+        }
+    }
+
+    return { ok: true, tickets };
+};
+
+// 🔹 POST /api/user/me/push-token
+exports.registerPushToken = async (req, res) => {
+    try {
+        const rawToken = req.body?.token;
+        const token = typeof rawToken === "string" ? rawToken.trim() : "";
+
+        if (!isExpoPushToken(token)) {
+            return res.status(400).json({ message: "Token push Expo invalide" });
+        }
+
+        const user = await User.findById(req.user.id).select("expoPushTokens status");
+        if (!user) return res.status(404).json({ message: "Utilisateur non trouvé" });
+        if (user.status && user.status !== "active") {
+            return res.status(403).json({ message: "Compte inactif" });
+        }
+
+        user.expoPushTokens = Array.isArray(user.expoPushTokens) ? user.expoPushTokens : [];
+        if (!user.expoPushTokens.includes(token)) {
+            user.expoPushTokens.push(token);
+            // Keep list reasonably small.
+            if (user.expoPushTokens.length > 20) {
+                user.expoPushTokens = user.expoPushTokens.slice(-20);
+            }
+            await user.save();
+        }
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("registerPushToken", error);
+        return res.status(500).json({ message: "Erreur serveur", error });
+    }
+};
+
+// 🔹 DELETE /api/user/me/push-token
+exports.unregisterPushToken = async (req, res) => {
+    try {
+        const rawToken = req.body?.token;
+        const token = typeof rawToken === "string" ? rawToken.trim() : "";
+        if (!token) {
+            return res.status(400).json({ message: "Token requis" });
+        }
+
+        const user = await User.findById(req.user.id).select("expoPushTokens status");
+        if (!user) return res.status(404).json({ message: "Utilisateur non trouvé" });
+        if (user.status && user.status !== "active") {
+            return res.status(403).json({ message: "Compte inactif" });
+        }
+
+        const before = Array.isArray(user.expoPushTokens) ? user.expoPushTokens : [];
+        user.expoPushTokens = before.filter((t) => t !== token);
+        await user.save();
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("unregisterPushToken", error);
+        return res.status(500).json({ message: "Erreur serveur", error });
+    }
+};
+
+// 🔹 POST /api/user/me/push-test
+exports.sendMyTestPush = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select("expoPushTokens notificationsEnabled status");
+        if (!user) return res.status(404).json({ message: "Utilisateur non trouvé" });
+        if (user.status && user.status !== "active") {
+            return res.status(403).json({ message: "Compte inactif" });
+        }
+        if (!user.notificationsEnabled) {
+            return res.status(400).json({ message: "Notifications désactivées" });
+        }
+
+        const tokens = Array.isArray(user.expoPushTokens) ? user.expoPushTokens : [];
+        if (!tokens.length) {
+            return res.status(400).json({ message: "Aucun appareil enregistré" });
+        }
+
+        const title = typeof req.body?.title === "string" ? req.body.title : "Talent-X";
+        const body = typeof req.body?.body === "string" ? req.body.body : "Notification de test";
+
+        const result = await sendExpoPush({
+            tokens,
+            title,
+            body,
+            data: { kind: "test" },
+        });
+
+        return res.json({ ok: true, result });
+    } catch (error) {
+        console.error("sendMyTestPush", error);
+        return res.status(500).json({ message: "Erreur serveur", error: { message: error?.message } });
     }
 };
 
@@ -368,7 +562,7 @@ exports.getPhoto = async (req, res) => {
         }
 
         res.set("Content-Type", user.photoContentType || "application/octet-stream");
-        res.set("Cache-Control", "public, max-age=86400, immutable");
+        res.set("Cache-Control", "no-store");
         return res.send(user.photoData);
     } catch (error) {
         console.error("Erreur lors de la récupération de la photo:", error);
@@ -606,15 +800,40 @@ exports.updateRecords = async (req, res) => {
 
 exports.searchUsers = async (req, res) => {
     try {
-        const query = (req.query.q || "").trim();
+        const query = String(req.query.q || "").trim();
         if (!query) {
             return res.json([]);
         }
-        const regex = new RegExp(`^${escapeRegex(query)}`, "i");
+
+        // Token-based search: allow matching by last name, first name, username,
+        // and multi-word queries (e.g. "ben idr" matching "Idris Benali").
+        const normalized = query.replace(/\s+/g, " ").trim();
+        const tokens = normalized
+            .split(" ")
+            .map((value) => value.trim())
+            .filter(Boolean)
+            .slice(0, 4);
+
+        if (!tokens.length) {
+            return res.json([]);
+        }
+
+        const tokenClauses = tokens.map((token) => {
+            const regex = new RegExp(escapeRegex(token), "i");
+            return {
+                $or: [
+                    { fullName: regex },
+                    { firstName: regex },
+                    { lastName: regex },
+                    { username: regex },
+                ],
+            };
+        });
+
         const results = await User.find({
             _id: { $ne: req.user.id },
             status: { $ne: "deleted" },
-            $or: [{ fullName: regex }, { username: regex }],
+            $and: tokenClauses,
         })
             .select("fullName username photoUrl")
             .sort({ fullName: 1 })
@@ -714,6 +933,14 @@ exports.sendFriendRequest = async (req, res) => {
             target.friendRequestsSent = pullObjectId(target.friendRequestsSent, viewer._id);
             pushUniqueObjectId(viewer.friends, target._id);
             pushUniqueObjectId(target.friends, viewer._id);
+
+            target.inboxNotifications = target.inboxNotifications || [];
+            target.inboxNotifications.unshift({
+                type: "friend_request_accepted",
+                message: `${viewer.fullName} a accepté votre demande d'amitié`,
+                data: { fromUserId: viewer._id?.toString?.() || viewerId },
+            });
+
             await Promise.all([viewer.save(), target.save()]);
             return res.json({
                 message: "Invitation acceptée",
@@ -784,6 +1011,13 @@ exports.respondFriendRequest = async (req, res) => {
             pushUniqueObjectId(requester.friends, viewer._id);
             status = "accepted";
             message = "Invitation acceptée";
+
+            requester.inboxNotifications = requester.inboxNotifications || [];
+            requester.inboxNotifications.unshift({
+                type: "friend_request_accepted",
+                message: `${viewer.fullName} a accepté votre demande d'amitié`,
+                data: { fromUserId: viewer._id?.toString?.() || viewerId },
+            });
         }
 
         await Promise.all([viewer.save(), requester.save()]);
@@ -853,6 +1087,84 @@ exports.removeFriend = async (req, res) => {
     } catch (error) {
         console.error("Erreur removeFriend:", error);
         res.status(500).json({ message: "Impossible de se désabonner", error });
+    }
+};
+
+// 🔔 GET /api/user/me/notifications
+exports.listMyNotifications = async (req, res) => {
+    try {
+        const viewerId = req.user.id;
+        const user = await User.findById(viewerId).select("inboxNotifications");
+        if (!user || user.status === "deleted") {
+            return res.status(404).json({ message: "Profil utilisateur introuvable" });
+        }
+
+        const notifications = Array.isArray(user.inboxNotifications) ? user.inboxNotifications : [];
+        const payload = notifications
+            .slice()
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+            .map((item) => ({
+                id: item._id?.toString?.() || item.id,
+                type: item.type,
+                message: item.message,
+                createdAt: item.createdAt,
+                data: item.data,
+            }));
+
+        return res.json(payload);
+    } catch (error) {
+        console.error("Erreur listMyNotifications:", error);
+        return res.status(500).json({ message: "Impossible de charger les notifications" });
+    }
+};
+
+// 🔔 DELETE /api/user/me/notifications/:notificationId
+exports.deleteMyNotification = async (req, res) => {
+    try {
+        const viewerId = req.user.id;
+        const notificationId = req.params.notificationId?.toString().trim();
+        if (!notificationId) {
+            return res.status(400).json({ message: "Identifiant de notification requis" });
+        }
+
+        const user = await User.findById(viewerId).select("inboxNotifications status");
+        if (!user || user.status === "deleted") {
+            return res.status(404).json({ message: "Profil utilisateur introuvable" });
+        }
+
+        const before = user.inboxNotifications?.length ?? 0;
+        user.inboxNotifications = (user.inboxNotifications || []).filter(
+            (item) => (item._id?.toString?.() || item.id?.toString?.()) !== notificationId,
+        );
+
+        const after = user.inboxNotifications?.length ?? 0;
+        if (after === before) {
+            return res.status(404).json({ message: "Notification introuvable" });
+        }
+
+        await user.save();
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("Erreur deleteMyNotification:", error);
+        return res.status(500).json({ message: "Impossible de supprimer la notification" });
+    }
+};
+
+// 🔔 DELETE /api/user/me/notifications
+exports.clearMyNotifications = async (req, res) => {
+    try {
+        const viewerId = req.user.id;
+        const user = await User.findById(viewerId).select("inboxNotifications status");
+        if (!user || user.status === "deleted") {
+            return res.status(404).json({ message: "Profil utilisateur introuvable" });
+        }
+
+        user.inboxNotifications = [];
+        await user.save();
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error("Erreur clearMyNotifications:", error);
+        return res.status(500).json({ message: "Impossible de supprimer les notifications" });
     }
 };
 

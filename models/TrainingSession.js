@@ -41,6 +41,9 @@ const trainingSeriesSegmentSchema = new mongoose.Schema(
                     if (this.blockType === "custom") {
                         return typeof value === "number" && value >= 0;
                     }
+                    if (this.blockType === "muscu") {
+                        return typeof value === "number" && value >= 0;
+                    }
                     return typeof value === "number" && value >= 1;
                 },
                 message: "La distance doit être positive pour ce bloc.",
@@ -50,12 +53,14 @@ const trainingSeriesSegmentSchema = new mongoose.Schema(
         restInterval: { type: Number, required: true, min: 0 },
         restUnit: { type: String, enum: ["s", "min"], default: "s" },
         blockName: { type: String, trim: true },
-        blockType: { type: String, enum: ["vitesse", "cotes", "ppg", "start", "recup", "custom"] },
+        blockType: { type: String, enum: ["vitesse", "cotes", "ppg", "muscu", "start", "recup", "custom"] },
         cotesMode: { type: String, enum: ["distance", "duration"] },
         durationSeconds: { type: Number, min: 0 },
         ppgExercises: { type: [String], default: [] },
         ppgDurationSeconds: { type: Number, min: 0 },
         ppgRestSeconds: { type: Number, min: 0 },
+        muscuExercises: { type: [String], default: [] },
+        muscuRepetitions: { type: Number, min: 0 },
         recoveryMode: { type: String, enum: ["marche", "footing", "passive", "active"] },
         recoveryDurationSeconds: { type: Number, min: 0 },
         startCount: { type: Number, min: 0 },
@@ -203,9 +208,12 @@ const trainingSessionSchema = new mongoose.Schema(
         coachNotes: { type: String, trim: true },
         athleteFeedback: { type: String, trim: true },
         equipment: { type: String, trim: true },
+        templateId: { type: mongoose.Schema.Types.ObjectId, ref: "TrainingTemplate", index: true },
+        templateSnapshot: { type: mongoose.Schema.Types.Mixed },
         participants: { type: [participantSchema], default: [] },
         chronos: { type: [chronoEntrySchema], default: [] },
         group: { type: mongoose.Schema.Types.ObjectId, ref: "TrainingGroup", index: true },
+        copiedFromSessionId: { type: mongoose.Schema.Types.ObjectId, ref: "TrainingSession", index: true },
         status: { type: String, enum: ["planned", "ongoing", "canceled", "done", "postponed"], default: "planned" },
     },
     { timestamps: true }
@@ -228,19 +236,39 @@ trainingSessionSchema.set("toJSON", {
         } else if (ret.athleteId) {
             ret.athleteId = ret.athleteId.toString();
         }
+
+        if (ret.templateId) {
+            if (typeof ret.templateId === "object" && ret.templateId._id) {
+                ret.templateId = ret.templateId._id.toString();
+            } else {
+                ret.templateId = ret.templateId.toString();
+            }
+        }
+
+        if (ret.copiedFromSessionId) {
+            if (typeof ret.copiedFromSessionId === "object" && ret.copiedFromSessionId._id) {
+                ret.copiedFromSessionId = ret.copiedFromSessionId._id.toString();
+            } else {
+                ret.copiedFromSessionId = ret.copiedFromSessionId.toString();
+            }
+        }
         if (Array.isArray(ret.participants)) {
             ret.participants = ret.participants.map(normalizeParticipantForJson);
         }
         if (ret.group) {
-            if (typeof ret.group === "object" && ret.group._id) {
-                const normalizedGroupId = ret.group._id.toString();
-                ret.groupId = normalizedGroupId;
-                ret.group = {
-                    id: normalizedGroupId,
-                    name: ret.group.name,
-                    description: ret.group.description,
-                };
-            } else {
+            if (typeof ret.group === "object") {
+                const normalizedGroupId = (ret.group._id || ret.group.id)?.toString();
+                if (normalizedGroupId) {
+                    ret.groupId = normalizedGroupId;
+                    ret.group = {
+                        id: normalizedGroupId,
+                        name: ret.group.name,
+                        description: ret.group.description,
+                    };
+                }
+            }
+
+            if (!ret.groupId) {
                 const normalizedGroupId = ret.group.toString();
                 ret.groupId = normalizedGroupId;
                 ret.group = { id: normalizedGroupId };

@@ -25,6 +25,20 @@ const medalsSchema = new mongoose.Schema(
     { _id: false }
 );
 
+const inboxNotificationSchema = new mongoose.Schema(
+    {
+        type: {
+            type: String,
+            required: true,
+            enum: ["friend_request_accepted", "group_join_accepted"],
+        },
+        message: { type: String, required: true, trim: true, maxlength: 200 },
+        data: { type: mongoose.Schema.Types.Mixed },
+        createdAt: { type: Date, default: Date.now },
+    },
+    { _id: true, timestamps: false }
+);
+
 const userSchema = new mongoose.Schema(
     {
         // 🔹 Informations de base
@@ -49,6 +63,7 @@ const userSchema = new mongoose.Schema(
         phoneNumber: { type: String, trim: true },
         trainingAddress: { type: String, trim: true },
         photoUrl: { type: String },
+        photoVersion: { type: Number, default: 0 },
         photoData: { type: Buffer, select: false },
         photoContentType: { type: String, select: false },
 
@@ -102,9 +117,24 @@ const userSchema = new mongoose.Schema(
         friendRequestsSent: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
         friendRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
 
+        // 🔔 Notifications persistées (inbox)
+        inboxNotifications: { type: [inboxNotificationSchema], default: [] },
+
+        // 📱 Push notifications (Expo)
+        // Stored server-side to target this device when sending pushes.
+        // Kept private (not returned by default in /me).
+        expoPushTokens: { type: [String], default: [], select: false },
+
         // 🔹 Compte & sécurité
         isVerified: { type: Boolean, default: false },
         status: { type: String, enum: ["active", "suspended", "deleted"], default: "active" },
+
+        // 🔐 Reset mot de passe (code email)
+        // Stocké en hash pour éviter de persister le code en clair.
+        passwordResetCodeHash: { type: String, select: false },
+        passwordResetExpiresAt: { type: Date, select: false },
+        passwordResetAttempts: { type: Number, default: 0, select: false },
+        passwordResetRequestedAt: { type: Date, select: false },
 
         // 🔹 Préférences
         isProfilePublic: { type: Boolean, default: true },
