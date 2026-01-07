@@ -165,4 +165,6 @@ const userSchema = new mongoose.Schema(
     }
 );
 
+userSchema.index({ licenseNumber: 1 }, { unique: true, sparse: true, name: "licenseNumber_1" });
+
 module.exports = mongoose.model("User", userSchema);

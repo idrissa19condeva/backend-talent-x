@@ -6,6 +6,7 @@ const { fetchFfaByName } = require("../services/ffaService");
 const EmailVerification = require("../models/EmailVerification");
 const { normalizePersonName } = require("../utils/nameFormat");
 const emailService = require("../services/emailService");
+const { normalizeLicenseNumber } = require("../utils/licenseNumber");
 
 const ACCESS_EXPIRES_IN = () => process.env.JWT_EXPIRES_IN || "7d";
 const REFRESH_EXPIRES_IN = () => process.env.JWT_REFRESH_EXPIRES_IN || "30d";
@@ -178,6 +179,22 @@ exports.checkEmail = async (req, res) => {
     }
 };
 
+// Vérifie si un numéro de licence existe déjà (pré-inscription)
+exports.checkLicense = async (req, res) => {
+    try {
+        const normalized = normalizeLicenseNumber(req.query.licenseNumber);
+        if (!normalized) {
+            return res.status(400).json({ message: "Numéro de licence requis" });
+        }
+
+        const existing = await User.findOne({ licenseNumber: normalized }).select("_id");
+        return res.json({ exists: Boolean(existing) });
+    } catch (error) {
+        console.error("checkLicense error", error);
+        return res.status(500).json({ message: "Erreur lors de la vérification" });
+    }
+};
+
 // Envoie un code OTP par email
 exports.requestEmailCode = async (req, res) => {
     try {
@@ -279,11 +296,13 @@ exports.signup = async (req, res) => {
     try {
         const { firstName, lastName, email, password, birthDate, gender, role, mainDisciplineFamily, mainDiscipline, licenseNumber } = req.body;
 
-        if (!firstName || !lastName || !email || !password || !birthDate || !gender || !role) {
+        const normalizedEmail = String(email || "").trim().toLowerCase();
+
+        if (!firstName || !lastName || !normalizedEmail || !password || !birthDate || !gender || !role) {
             return res.status(400).json({ message: "Tous les champs sont requis" });
         }
 
-        const normalizedLicense = String(licenseNumber || "").trim();
+        const normalizedLicense = normalizeLicenseNumber(licenseNumber);
         const isCoach = String(role).trim() === "coach";
         if (!isCoach && !normalizedLicense) {
             return res.status(400).json({ message: "Le numéro de licence est requis" });
@@ -301,13 +320,20 @@ exports.signup = async (req, res) => {
             return res.status(400).json({ message: "Genre invalide" });
         }
 
-        const existingUser = await User.findOne({ email });
+        const existingUser = await User.findOne({ email: normalizedEmail }).select("_id");
         if (existingUser) {
             return res.status(400).json({ message: "Email déjà utilisé" });
         }
 
+        if (!isCoach && normalizedLicense) {
+            const existingByLicense = await User.findOne({ licenseNumber: normalizedLicense }).select("_id");
+            if (existingByLicense) {
+                return res.status(409).json({ message: "Numéro de licence déjà utilisé" });
+            }
+        }
+
         // Ensure email was verified recently
-        const recentVerification = await EmailVerification.findOne({ email, verifiedAt: { $ne: null } })
+        const recentVerification = await EmailVerification.findOne({ email: normalizedEmail, verifiedAt: { $ne: null } })
             .sort({ verifiedAt: -1 })
             .exec();
 
@@ -325,7 +351,7 @@ exports.signup = async (req, res) => {
             fullName: normalizedFullName,
             firstName: normalizedFirstName,
             lastName: normalizedLastName,
-            email,
+            email: normalizedEmail,
             passwordHash: hashedPassword,
             birthDate: parsedBirthDate,
             gender,
@@ -520,7 +546,18 @@ exports.signup = async (req, res) => {
         });
     } catch (err) {
         console.error("Erreur signup :", err);
-        res.status(500).json({ message: "Erreur serveur" });
+
+        if (err && err.code === 11000) {
+            const key = Object.keys(err.keyPattern || err.keyValue || {})[0];
+            if (key === "licenseNumber") {
+                return res.status(409).json({ message: "Numéro de licence déjà utilisé" });
+            }
+            if (key === "email") {
+                return res.status(400).json({ message: "Email déjà utilisé" });
+            }
+        }
+
+        return res.status(500).json({ message: "Erreur serveur" });
     }
 };
 

@@ -84,6 +84,47 @@ const ensureTrainingGroupNameKeyIndex = async () => {
     }
 };
 
+const ensureLicenseNumberIndex = async () => {
+    const User = require("./models/User");
+    const { normalizeLicenseNumber } = require("./utils/licenseNumber");
+
+    // Backfill / normalize existing license numbers to digits-only.
+    const cursor = User.find({ licenseNumber: { $exists: true, $ne: null } })
+        .select("_id licenseNumber")
+        .cursor();
+
+    for await (const doc of cursor) {
+        const current = doc.licenseNumber;
+        if (current === undefined) continue;
+        const normalized = normalizeLicenseNumber(current);
+
+        if (!normalized) {
+            await User.updateOne({ _id: doc._id }, { $unset: { licenseNumber: "" } });
+            continue;
+        }
+
+        if (normalized !== current) {
+            await User.updateOne({ _id: doc._id }, { $set: { licenseNumber: normalized } });
+        }
+    }
+
+    // Ensure index is sparse+unique
+    const indexes = await User.collection.indexes();
+    const idx = indexes.find((i) => i.name === "licenseNumber_1");
+    const needsFix = idx && (!idx.unique || !idx.sparse);
+    if (needsFix) {
+        await User.collection.dropIndex("licenseNumber_1");
+    }
+
+    if (!idx || needsFix) {
+        await User.collection.createIndex(
+            { licenseNumber: 1 },
+            { unique: true, sparse: true, name: "licenseNumber_1" }
+        );
+        console.log("🔧 Index licenseNumber_1 recréé en sparse unique");
+    }
+};
+
 const start = async () => {
     try {
         await mongoose.connect(process.env.MONGO_URI);
@@ -99,6 +140,12 @@ const start = async () => {
             await ensureTrainingGroupNameKeyIndex();
         } catch (indexErr) {
             console.warn("⚠️ Impossible de vérifier/créer l'index nameKey_1 :", indexErr.message);
+        }
+
+        try {
+            await ensureLicenseNumberIndex();
+        } catch (indexErr) {
+            console.warn("⚠️ Impossible de vérifier/créer l'index licenseNumber_1 :", indexErr.message);
         }
 
         const PORT = process.env.PORT || 4001;

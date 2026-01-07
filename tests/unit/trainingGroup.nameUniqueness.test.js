@@ -15,6 +15,11 @@ const makeUser = async (overrides = {}) => {
 };
 
 describe("TrainingGroup name uniqueness", () => {
+    beforeAll(async () => {
+        // Ensure unique indexes are created before running expectations on E11000.
+        await TrainingGroup.init();
+    });
+
     it("enforces case-insensitive uniqueness (Couloir V == couloir v)", async () => {
         const owner = await makeUser();
 

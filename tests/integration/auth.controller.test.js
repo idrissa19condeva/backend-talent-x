@@ -47,6 +47,24 @@ const createVerifiedEmail = async (email, { minutesAgo = 0 } = {}) => {
 };
 
 describe("authController integration", () => {
+    test("checkLicense returns exists when a licenseNumber is present", async () => {
+        await User.create({
+            fullName: "Licensed User",
+            firstName: "Licensed",
+            lastName: "User",
+            email: "licensed@example.com",
+            passwordHash: await bcrypt.hash("P@ssw0rd!", 10),
+            licenseNumber: "12345",
+        });
+
+        const yes = await request(app).get("/api/auth/check-license").query({ licenseNumber: "12 345" });
+        expect(yes.status).toBe(200);
+        expect(yes.body).toEqual({ exists: true });
+
+        const no = await request(app).get("/api/auth/check-license").query({ licenseNumber: "99999" });
+        expect(no.status).toBe(200);
+        expect(no.body).toEqual({ exists: false });
+    });
     test("checkEmail returns exists when a user is present", async () => {
         await User.create({
             fullName: "Ada Lovelace",
@@ -313,6 +331,31 @@ describe("authController integration", () => {
         expect(res.body?.user?.email).toBe("okathlete@example.com");
         expect(res.body?.token).toBeTruthy();
         expect(res.body?.refreshToken).toBeTruthy();
+    });
+
+    test("signup athlete rejects duplicate licenseNumber", async () => {
+        await createVerifiedEmail("first@example.com");
+        await createVerifiedEmail("second@example.com");
+
+        const first = await request(app)
+            .post("/api/auth/signup")
+            .send(buildUserPayload({
+                email: "first@example.com",
+                role: "athlete",
+                licenseNumber: "12 345",
+            }));
+        expect(first.status).toBe(201);
+
+        const second = await request(app)
+            .post("/api/auth/signup")
+            .send(buildUserPayload({
+                email: "second@example.com",
+                role: "athlete",
+                licenseNumber: "12345",
+            }));
+
+        expect(second.status).toBe(409);
+        expect(second.body?.message?.toLowerCase?.()).toContain("licence");
     });
 
     test("signup succeeds for a verified coach", async () => {
