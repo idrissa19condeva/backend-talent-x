@@ -43,15 +43,18 @@ exports.requestPasswordResetCode = async (req, res) => {
             user.passwordResetRequestedAt = new Date();
             await user.save();
 
-            try {
-                if (typeof emailService.sendPasswordResetCode === "function") {
-                    await emailService.sendPasswordResetCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
-                } else {
-                    await emailService.sendVerificationCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
+            // Envoi email en arrière-plan: ne bloque pas la réponse HTTP.
+            setImmediate(async () => {
+                try {
+                    if (typeof emailService.sendPasswordResetCode === "function") {
+                        await emailService.sendPasswordResetCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
+                    } else {
+                        await emailService.sendVerificationCode(email, code, PASSWORD_RESET_CODE_TTL_MINUTES);
+                    }
+                } catch (mailErr) {
+                    console.error("sendPasswordResetCode error", mailErr);
                 }
-            } catch (mailErr) {
-                console.error("sendPasswordResetCode error", mailErr);
-            }
+            });
         }
 
         return res.json({ ok: true });
@@ -197,13 +200,19 @@ exports.requestEmailCode = async (req, res) => {
             { upsert: true, new: true, setDefaultsOnInsert: true },
         );
 
-        try {
-            await emailService.sendVerificationCode(email, code, EMAIL_CODE_TTL_MINUTES);
-        } catch (mailErr) {
-            console.error("sendVerificationCode error", mailErr);
-        }
+        // Répond vite, puis envoie l'email en arrière-plan.
+        const response = { ok: true, expiresAt };
+        res.json(response);
 
-        return res.json({ ok: true, expiresAt });
+        setImmediate(async () => {
+            try {
+                await emailService.sendVerificationCode(email, code, EMAIL_CODE_TTL_MINUTES);
+            } catch (mailErr) {
+                console.error("sendVerificationCode error", mailErr);
+            }
+        });
+
+        return;
     } catch (error) {
         console.error("requestEmailCode error", error);
         return res.status(500).json({ message: "Impossible d'envoyer le code" });

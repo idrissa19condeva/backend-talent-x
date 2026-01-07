@@ -1,4 +1,5 @@
 const nodemailer = require("nodemailer");
+const fetch = require("node-fetch");
 
 const smtpHost = process.env.SMTP_HOST;
 const smtpPort = Number(process.env.SMTP_PORT || 587);
@@ -7,12 +8,64 @@ const smtpPass = process.env.SMTP_PASS;
 const smtpFrom = process.env.SMTP_FROM || smtpUser || "no-reply@tracknfield.app";
 const isConfigured = Boolean(smtpHost && smtpUser && smtpPass);
 
+// Brevo API (recommended on platforms that block outbound SMTP)
+const brevoApiKey = process.env.BREVO_API_KEY;
+const brevoSenderEmail = process.env.BREVO_SENDER_EMAIL || process.env.SMTP_FROM;
+const brevoSenderName = process.env.BREVO_SENDER_NAME || "Talent-X";
+const isBrevoConfigured = Boolean(brevoApiKey && brevoSenderEmail);
+
+const brevoTimeoutMs = Number(process.env.BREVO_TIMEOUT_MS || 10_000);
+
+const sendBrevoEmail = async ({ to, subject, text, html }) => {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeout = setTimeout(() => controller?.abort(), brevoTimeoutMs);
+
+    try {
+        const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+            method: "POST",
+            headers: {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "api-key": brevoApiKey,
+            },
+            body: JSON.stringify({
+                sender: { email: brevoSenderEmail, name: brevoSenderName },
+                to: [{ email: to }],
+                subject,
+                textContent: text,
+                htmlContent: html,
+            }),
+            signal: controller?.signal,
+        });
+
+        if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            const err = new Error(`Brevo API error: status=${res.status} body=${body}`);
+            err.status = res.status;
+            throw err;
+        }
+
+        return true;
+    } finally {
+        clearTimeout(timeout);
+    }
+};
+
+const connectionTimeoutMs = Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10_000);
+const greetingTimeoutMs = Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10_000);
+const socketTimeoutMs = Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20_000);
+
 const transporter = isConfigured
     ? nodemailer.createTransport({
         host: smtpHost,
         port: smtpPort,
         secure: smtpPort === 465 || String(process.env.SMTP_SECURE || "").toLowerCase() === "true",
         auth: { user: smtpUser, pass: smtpPass },
+        pool: true,
+        maxConnections: 1,
+        connectionTimeout: connectionTimeoutMs,
+        greetingTimeout: greetingTimeoutMs,
+        socketTimeout: socketTimeoutMs,
     })
     : null;
 
@@ -78,16 +131,26 @@ Si vous n’êtes pas à l’origine de cette demande, vous pouvez ignorer cet e
 `;
 
 
-    if (!isConfigured || !transporter) {
-        console.warn("SMTP non configuré, code OTP loggé pour debug", { email: to, code });
+    if (!isBrevoConfigured && (!isConfigured || !transporter)) {
+        console.warn("Email non configuré (Brevo API/SMTP), code OTP loggé pour debug", { email: to, code });
         return;
     }
 
     try {
-        await transporter.sendMail({ from: smtpFrom, to, subject, text, html });
+        const start = Date.now();
+        if (isBrevoConfigured) {
+            await sendBrevoEmail({ to, subject, text, html });
+        } else {
+            await transporter.sendMail({ from: smtpFrom, to, subject, text, html });
+        }
+        const ms = Date.now() - start;
+        if (ms > 3000) {
+            console.warn("sendVerificationCode slow", { ms, to, provider: isBrevoConfigured ? "brevo-api" : "smtp", host: smtpHost, port: smtpPort });
+        }
     } catch (err) {
         console.error("sendVerificationCode mail error", err);
-        throw err;
+        // On ne propage pas l'erreur: l'API ne doit pas échouer juste parce que l'email est lent/indisponible.
+        return;
     }
 };
 
@@ -107,15 +170,24 @@ exports.sendPasswordResetCode = async (email, code, ttlMinutes = 10) => {
         </div>
     `;
 
-    if (!isConfigured || !transporter) {
-        console.warn("SMTP non configuré, code reset loggé pour debug", { email: to, code });
+    if (!isBrevoConfigured && (!isConfigured || !transporter)) {
+        console.warn("Email non configuré (Brevo API/SMTP), code reset loggé pour debug", { email: to, code });
         return;
     }
 
     try {
-        await transporter.sendMail({ from: smtpFrom, to, subject, text, html });
+        const start = Date.now();
+        if (isBrevoConfigured) {
+            await sendBrevoEmail({ to, subject, text, html });
+        } else {
+            await transporter.sendMail({ from: smtpFrom, to, subject, text, html });
+        }
+        const ms = Date.now() - start;
+        if (ms > 3000) {
+            console.warn("sendPasswordResetCode slow", { ms, to, provider: isBrevoConfigured ? "brevo-api" : "smtp", host: smtpHost, port: smtpPort });
+        }
     } catch (err) {
         console.error("sendPasswordResetCode mail error", err);
-        throw err;
+        return;
     }
 };
