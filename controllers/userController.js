@@ -1,5 +1,9 @@
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
+const TrainingGroup = require("../models/TrainingGroup");
+const TrainingTemplate = require("../models/TrainingTemplate");
+const TrainingBlock = require("../models/TrainingBlock");
+const TrainingSession = require("../models/TrainingSession");
 const fetch = require("node-fetch");
 const { buildPerformancePoints } = require("../services/ffaService");
 const sharp = require("sharp");
@@ -253,6 +257,60 @@ exports.deleteAccount = async (req, res) => {
             return res.status(404).json({ message: "Utilisateur non trouvé" });
         }
 
+        // 1) Delete everything the user owns
+        await Promise.all([
+            TrainingGroup.deleteMany({ owner: userId }),
+            TrainingTemplate.deleteMany({ ownerId: userId }),
+            TrainingBlock.deleteMany({ ownerId: userId }),
+            TrainingSession.deleteMany({ athleteId: userId }),
+        ]);
+
+        // 2) Remove references in other collections
+        await Promise.all([
+            // Groups: membership/invites/requests
+            TrainingGroup.updateMany(
+                { "members.user": userId },
+                { $pull: { members: { user: userId } } }
+            ),
+            TrainingGroup.updateMany(
+                { "memberInvites.user": userId },
+                { $pull: { memberInvites: { user: userId } } }
+            ),
+            TrainingGroup.updateMany(
+                { "memberInvites.invitedBy": userId },
+                { $pull: { memberInvites: { invitedBy: userId } } }
+            ),
+            TrainingGroup.updateMany(
+                { "joinRequests.user": userId },
+                { $pull: { joinRequests: { user: userId } } }
+            ),
+
+            // Sessions: remove participations and chronos linked to this user
+            TrainingSession.updateMany(
+                { "participants.user": userId },
+                { $pull: { participants: { user: userId } } }
+            ),
+            TrainingSession.updateMany(
+                { "participants.addedBy": userId },
+                { $pull: { participants: { addedBy: userId } } }
+            ),
+            TrainingSession.updateMany(
+                { "chronos.participant": userId },
+                { $pull: { chronos: { participant: userId } } }
+            ),
+            TrainingSession.updateMany(
+                { "chronos.updatedBy": userId },
+                { $unset: { "chronos.$[c].updatedBy": "" } },
+                { arrayFilters: [{ "c.updatedBy": userId }] }
+            ),
+
+            // Users: remove friendships/requests referencing this user
+            User.updateMany({ friends: userId }, { $pull: { friends: userId } }),
+            User.updateMany({ friendRequestsSent: userId }, { $pull: { friendRequestsSent: userId } }),
+            User.updateMany({ friendRequestsReceived: userId }, { $pull: { friendRequestsReceived: userId } }),
+        ]);
+
+        // 3) Finally remove the user document
         await User.deleteOne({ _id: userId });
 
         return res.json({ message: "Compte supprimé" });
