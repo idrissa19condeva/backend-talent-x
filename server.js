@@ -44,6 +44,46 @@ const ensureUsernameIndex = async () => {
     }
 };
 
+const ensureTrainingGroupNameKeyIndex = async () => {
+    const TrainingGroup = require("./models/TrainingGroup");
+
+    // Backfill missing nameKey for existing groups.
+    // Uses an aggregation pipeline update to compute: trim(name) + lowercase.
+    await TrainingGroup.updateMany(
+        {
+            $or: [{ nameKey: { $exists: false } }, { nameKey: null }, { nameKey: "" }],
+        },
+        [
+            {
+                $set: {
+                    nameKey: {
+                        $toLower: {
+                            $trim: { input: "$name" },
+                        },
+                    },
+                },
+            },
+        ]
+    );
+
+    // Ensure the nameKey index is sparse unique to avoid duplicate null issues during rollout.
+    const indexes = await TrainingGroup.collection.indexes();
+    const nameKeyIndex = indexes.find((idx) => idx.name === "nameKey_1");
+    const needsFix = nameKeyIndex && (!nameKeyIndex.unique || !nameKeyIndex.sparse);
+
+    if (needsFix) {
+        await TrainingGroup.collection.dropIndex("nameKey_1");
+    }
+
+    if (!nameKeyIndex || needsFix) {
+        await TrainingGroup.collection.createIndex(
+            { nameKey: 1 },
+            { unique: true, sparse: true, name: "nameKey_1" }
+        );
+        console.log("🔧 Index nameKey_1 recréé en sparse unique");
+    }
+};
+
 const start = async () => {
     try {
         await mongoose.connect(process.env.MONGO_URI);
@@ -53,6 +93,12 @@ const start = async () => {
             await ensureUsernameIndex();
         } catch (indexErr) {
             console.warn("⚠️ Impossible de vérifier/créer l'index username_1 :", indexErr.message);
+        }
+
+        try {
+            await ensureTrainingGroupNameKeyIndex();
+        } catch (indexErr) {
+            console.warn("⚠️ Impossible de vérifier/créer l'index nameKey_1 :", indexErr.message);
         }
 
         const PORT = process.env.PORT || 4001;

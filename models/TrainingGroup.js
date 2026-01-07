@@ -17,9 +17,12 @@ const toSlug = (value = "") =>
         .replace(/^-+|-+$/g, "")
         .replace(/-{2,}/g, "-");
 
+const toNameKey = (value = "") => value.toString().trim().toLowerCase();
+
 const trainingGroupSchema = new mongoose.Schema(
     {
         name: { type: String, required: true, trim: true, maxlength: 80 },
+        nameKey: { type: String, required: true, select: false },
         slug: { type: String, required: true, unique: true, lowercase: true, index: true },
         description: { type: String, trim: true, maxlength: 240 },
         owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
@@ -47,11 +50,28 @@ const trainingGroupSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-trainingGroupSchema.pre("validate", function setSlug(next) {
-    if (this.name) {
-        this.slug = toSlug(this.name);
+trainingGroupSchema.index({ nameKey: 1 }, { unique: true, sparse: true });
+
+trainingGroupSchema.pre("validate", async function setKeys() {
+    if (!this.name) return;
+
+    this.nameKey = toNameKey(this.name);
+
+    const baseSlug = toSlug(this.name) || "group";
+    let candidate = baseSlug;
+    let counter = 2;
+
+    while (
+        await this.constructor.exists({
+            slug: candidate,
+            _id: { $ne: this._id },
+        })
+    ) {
+        candidate = `${baseSlug}-${counter}`;
+        counter += 1;
     }
-    next();
+
+    this.slug = candidate;
 });
 
 trainingGroupSchema.set("toJSON", {
@@ -60,6 +80,8 @@ trainingGroupSchema.set("toJSON", {
     transform: (_doc, ret) => {
         ret.id = ret._id.toString();
         delete ret._id;
+        delete ret.slug;
+        delete ret.nameKey;
         if (ret.owner) {
             ret.owner = ret.owner.toString();
         }
