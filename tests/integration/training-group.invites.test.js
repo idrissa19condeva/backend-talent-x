@@ -24,6 +24,19 @@ const createUser = async (overrides = {}) => {
 const signToken = (user) => jwt.sign({ id: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: "1h" });
 
 describe("training group member invites (integration)", () => {
+    test("athlete cannot create a group (coach-only)", async () => {
+        const athlete = await createUser({ role: "athlete", firstName: "Athlete", lastName: "Only" });
+        const athleteToken = signToken(athlete);
+
+        const res = await request(app)
+            .post("/api/groups")
+            .set("Authorization", `Bearer ${athleteToken}`)
+            .send({ name: `Groupe interdit ${Date.now()}` });
+
+        expect(res.status).toBe(403);
+        expect((res.body?.message || "").toLowerCase()).toContain("coach");
+    });
+
     test("owner can invite a user; invite appears in /groups/mine; invitee can accept", async () => {
         const owner = await createUser({ role: "coach", firstName: "Owner", lastName: "Coach" });
         const invitee = await createUser({ role: "athlete", firstName: "Invitee", lastName: "Athlete" });

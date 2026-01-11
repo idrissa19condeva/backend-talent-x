@@ -99,6 +99,14 @@ const formatGroup = (group, currentUserId, options = {}) => {
 
 exports.createGroup = async (req, res) => {
     try {
+        const requester = await User.findById(req.user.id).select("role");
+        if (!requester) {
+            return res.status(401).json({ message: "Utilisateur introuvable" });
+        }
+        if (requester.role !== "coach") {
+            return res.status(403).json({ message: "Seuls les coachs peuvent créer un groupe" });
+        }
+
         const { name, description } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ message: "Le nom du groupe est requis." });
