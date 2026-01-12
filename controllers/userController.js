@@ -6,6 +6,7 @@ const TrainingBlock = require("../models/TrainingBlock");
 const TrainingSession = require("../models/TrainingSession");
 const fetch = require("node-fetch");
 const { buildPerformancePoints } = require("../services/ffaService");
+const { sendExpoPush } = require("../services/expoPushService");
 const sharp = require("sharp");
 
 const sanitizeMapMerge = (source, incoming) => {
@@ -460,62 +461,36 @@ exports.uploadPhoto = async (req, res) => {
     }
 };
 
-const isExpoPushToken = (token) => {
-    if (typeof token !== "string") return false;
-    const trimmed = token.trim();
-    return trimmed.startsWith("ExponentPushToken[") || trimmed.startsWith("ExpoPushToken[");
-};
+const trySendInboxPush = async (userId, notificationDoc) => {
+    try {
+        const resolvedUserId = toObjectIdString(userId);
+        if (!resolvedUserId) return;
 
-const chunkArray = (items = [], size = 100) => {
-    const chunks = [];
-    for (let i = 0; i < items.length; i += size) {
-        chunks.push(items.slice(i, i + size));
-    }
-    return chunks;
-};
+        // expoPushTokens is select:false -> always re-fetch explicitly.
+        const user = await User.findById(resolvedUserId).select("expoPushTokens notificationsEnabled status");
+        if (!user) return;
+        if (user.status && user.status !== "active") return;
+        if (!user.notificationsEnabled) return;
 
-const sendExpoPush = async ({ tokens, title, body, data }) => {
-    const messages = (tokens || [])
-        .filter(isExpoPushToken)
-        .map((token) => ({
-            to: token,
-            sound: "default",
-            title: title || "Talent-X",
-            body: body || "",
-            data: data || {},
-        }));
+        const tokens = Array.isArray(user.expoPushTokens) ? user.expoPushTokens : [];
+        if (!tokens.length) return;
 
-    if (!messages.length) {
-        return { ok: true, tickets: [], message: "No valid Expo push tokens" };
-    }
-
-    const tickets = [];
-    const chunks = chunkArray(messages, 100);
-
-    for (const chunk of chunks) {
-        const response = await fetch("https://exp.host/--/api/v2/push/send", {
-            method: "POST",
-            headers: {
-                Accept: "application/json",
-                "Accept-Encoding": "gzip, deflate",
-                "Content-Type": "application/json",
+        const body = typeof notificationDoc?.message === "string" ? notificationDoc.message : "";
+        await sendExpoPush({
+            tokens,
+            title: "Talent-X",
+            body,
+            data: {
+                kind: "inbox",
+                notificationType: notificationDoc?.type,
+                notificationId: notificationDoc?._id?.toString?.(),
+                ...(notificationDoc?.data || {}),
             },
-            body: JSON.stringify(chunk),
         });
-
-        const json = await response.json().catch(() => null);
-        if (!response.ok) {
-            const message = json?.errors?.[0]?.message || json?.message || `Expo push error (${response.status})`;
-            throw new Error(message);
-        }
-
-        const chunkTickets = json?.data;
-        if (Array.isArray(chunkTickets)) {
-            tickets.push(...chunkTickets);
-        }
+    } catch (e) {
+        // Non-bloquant : on ne doit pas casser le flow métier si Expo est down.
+        console.warn("trySendInboxPush non bloquant:", e?.message || e);
     }
-
-    return { ok: true, tickets };
 };
 
 // 🔹 POST /api/user/me/push-token
@@ -1000,6 +975,7 @@ exports.sendFriendRequest = async (req, res) => {
             });
 
             await Promise.all([viewer.save(), target.save()]);
+            await trySendInboxPush(target._id, target.inboxNotifications?.[0]);
             return res.json({
                 message: "Invitation acceptée",
                 status: "accepted",
@@ -1009,7 +985,19 @@ exports.sendFriendRequest = async (req, res) => {
 
         pushUniqueObjectId(viewer.friendRequestsSent, target._id);
         pushUniqueObjectId(target.friendRequestsReceived, viewer._id);
+
+        // 🔔 Inbox notification for the target (new friend request)
+        target.inboxNotifications = target.inboxNotifications || [];
+        target.inboxNotifications.unshift({
+            type: "friend_request_received",
+            message: `${viewer.fullName} vous a envoyé une demande d'amitié`,
+            data: { fromUserId: viewer._id?.toString?.() || viewerId },
+        });
+
         await Promise.all([viewer.save(), target.save()]);
+
+        // Non-bloquant
+        await trySendInboxPush(target._id, target.inboxNotifications?.[0]);
 
         return res.status(201).json({
             message: "Invitation envoyée",
@@ -1079,6 +1067,9 @@ exports.respondFriendRequest = async (req, res) => {
         }
 
         await Promise.all([viewer.save(), requester.save()]);
+        if (action === "accept") {
+            await trySendInboxPush(requester._id, requester.inboxNotifications?.[0]);
+        }
 
         return res.json({
             message,

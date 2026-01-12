@@ -1,3 +1,9 @@
+jest.mock("../../services/inboxNotificationService", () => ({
+    createInboxNotificationsForUsers: jest.fn().mockResolvedValue([]),
+    createInboxNotificationForUser: jest.fn().mockResolvedValue(null),
+}));
+
+const { createInboxNotificationsForUsers } = require("../../services/inboxNotificationService");
 const trainingController = require("../../controllers/trainingController");
 const User = require("../../models/User");
 const TrainingGroup = require("../../models/TrainingGroup");
@@ -34,6 +40,10 @@ describe("trainingController.attachSessionToGroup", () => {
         if (consoleErrorSpy) {
             consoleErrorSpy.mockRestore();
         }
+    });
+
+    beforeEach(() => {
+        jest.clearAllMocks();
     });
 
     it("creates an independent copy in the group and keeps the source session personal", async () => {
@@ -98,6 +108,93 @@ describe("trainingController.attachSessionToGroup", () => {
         expect(storedCopy.type).toBe("vitesse");
         expect(storedCopy.startTime).toBe("09:00");
         expect(storedCopy.durationMinutes).toBe(60);
+
+        // Notify group members about the share.
+        expect(createInboxNotificationsForUsers).toHaveBeenCalledTimes(1);
+        const [memberIds, notification] = createInboxNotificationsForUsers.mock.calls[0];
+        expect(memberIds).toEqual([]);
+        expect(notification).toMatchObject({
+            type: "group_session_shared",
+        });
+    });
+
+    it("notifies group members when a session is shared", async () => {
+        const owner = await makeUser();
+        const member = await makeUser();
+        const group = await TrainingGroup.create({
+            name: "Groupe test",
+            owner: owner._id,
+            members: [{ user: member._id, joinedAt: new Date() }],
+        });
+
+        const source = await TrainingSession.create({
+            athleteId: owner._id,
+            date: new Date(2026, 0, 4),
+            startTime: "09:00",
+            durationMinutes: 60,
+            type: "vitesse",
+            title: "Séance perso",
+            series: [{ id: "s1", segments: [] }],
+        });
+
+        const req = {
+            params: { id: group.id },
+            body: { sessionId: source.id },
+            user: { id: owner.id },
+        };
+        const res = makeRes();
+
+        await trainingController.attachSessionToGroup(req, res);
+
+        expect(createInboxNotificationsForUsers).toHaveBeenCalledTimes(1);
+        const [memberIds, notification] = createInboxNotificationsForUsers.mock.calls[0];
+        expect(memberIds).toEqual([member.id]);
+        expect(notification).toMatchObject({
+            type: "group_session_shared",
+            data: { groupId: group.id },
+        });
+        expect(notification?.data?.sessionId).toBeTruthy();
+        expect(notification?.data?.copiedFromSessionId).toBe(source.id);
+    });
+
+    it("notifies group members when a shared session is removed", async () => {
+        const owner = await makeUser();
+        const member = await makeUser();
+        const group = await TrainingGroup.create({
+            name: "Groupe test",
+            owner: owner._id,
+            members: [{ user: member._id, joinedAt: new Date() }],
+        });
+
+        const source = await TrainingSession.create({
+            athleteId: owner._id,
+            date: new Date(2026, 0, 4),
+            startTime: "09:00",
+            durationMinutes: 60,
+            type: "vitesse",
+            title: "Séance perso",
+            series: [{ id: "s1", segments: [] }],
+        });
+
+        const attachReq = { params: { id: group.id }, body: { sessionId: source.id }, user: { id: owner.id } };
+        const attachRes = makeRes();
+        await trainingController.attachSessionToGroup(attachReq, attachRes);
+        const raw = attachRes.json.mock.calls[0][0];
+        const created = raw && typeof raw.toJSON === "function" ? raw.toJSON() : raw;
+
+        jest.clearAllMocks();
+
+        const detachReq = { params: { id: group.id, sessionId: created.id }, user: { id: owner.id } };
+        const detachRes = makeRes();
+        await trainingController.detachSessionFromGroup(detachReq, detachRes);
+
+        expect(createInboxNotificationsForUsers).toHaveBeenCalledTimes(1);
+        const [memberIds, notification] = createInboxNotificationsForUsers.mock.calls[0];
+        expect(memberIds).toEqual([member.id]);
+        expect(notification).toMatchObject({
+            type: "group_session_removed",
+            data: { groupId: group.id, sessionId: created.id },
+        });
     });
 
     it("returns the existing copy if the same source was already shared to this group", async () => {

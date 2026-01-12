@@ -1,6 +1,7 @@
 const TrainingGroup = require("../models/TrainingGroup");
 const TrainingSession = require("../models/TrainingSession");
 const User = require("../models/User");
+const { createInboxNotificationForUser } = require("../services/inboxNotificationService");
 
 const OWNER_POPULATION = { path: "owner", select: "fullName username photoUrl" };
 const MEMBER_POPULATION = { path: "members.user", select: "fullName username photoUrl" };
@@ -99,6 +100,14 @@ const formatGroup = (group, currentUserId, options = {}) => {
 
 exports.createGroup = async (req, res) => {
     try {
+        const requester = await User.findById(req.user.id).select("role");
+        if (!requester) {
+            return res.status(401).json({ message: "Utilisateur introuvable" });
+        }
+        if (requester.role !== "coach") {
+            return res.status(403).json({ message: "Seuls les coachs peuvent créer un groupe" });
+        }
+
         const { name, description } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ message: "Le nom du groupe est requis." });
@@ -284,6 +293,21 @@ exports.joinGroup = async (req, res) => {
         group.joinRequests.push({ user: userId, requestedAt: new Date() });
         await group.save();
         await group.populate(OWNER_POPULATION);
+
+        // Notify group owner (coach) about the join request.
+        try {
+            const requester = await User.findById(userId).select("fullName username status");
+            if (requester && (!requester.status || requester.status === "active")) {
+                const requesterName = requester.fullName || requester.username || "Un athlète";
+                await createInboxNotificationForUser(ownerId, {
+                    type: "group_join_requested",
+                    message: `${requesterName} a demandé à rejoindre le groupe "${group.name}"`,
+                    data: { groupId: group._id?.toString?.() || req.params.id, requesterId: userId },
+                });
+            }
+        } catch (e) {
+            console.warn("Notification group_join_requested non bloquante:", e?.message || e);
+        }
 
         res.status(202).json({ message: "Demande envoyée au coach", ...formatGroup(group, userId) });
     } catch (error) {
@@ -551,24 +575,12 @@ exports.acceptJoinRequest = async (req, res) => {
         group.members.push({ user: targetUserId, joinedAt: new Date() });
         group.joinRequests.splice(pendingIndex, 1);
 
-        const notifyTarget = async () => {
-            try {
-                const targetUser = await User.findById(targetUserId).select("inboxNotifications fullName status");
-                if (!targetUser || targetUser.status === "deleted") return;
-                targetUser.inboxNotifications = targetUser.inboxNotifications || [];
-                targetUser.inboxNotifications.unshift({
-                    type: "group_join_accepted",
-                    message: `Votre demande pour rejoindre le groupe \"${group.name}\" a été acceptée`,
-                    data: { groupId: group._id?.toString?.() || req.params.id },
-                });
-                await targetUser.save();
-            } catch (e) {
-                console.warn("Notification join accepted non bloquante:", e?.message || e);
-            }
-        };
-
         await group.save();
-        await notifyTarget();
+        await createInboxNotificationForUser(targetUserId, {
+            type: "group_join_accepted",
+            message: `Votre demande pour rejoindre le groupe "${group.name}" a été acceptée`,
+            data: { groupId: group._id?.toString?.() || req.params.id },
+        });
         await group.populate(OWNER_POPULATION);
         await group.populate(MEMBER_POPULATION);
         await group.populate(INVITE_POPULATION);

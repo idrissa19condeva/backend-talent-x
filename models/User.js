@@ -30,7 +30,14 @@ const inboxNotificationSchema = new mongoose.Schema(
         type: {
             type: String,
             required: true,
-            enum: ["friend_request_accepted", "group_join_accepted"],
+            enum: [
+                "friend_request_received",
+                "friend_request_accepted",
+                "group_join_requested",
+                "group_join_accepted",
+                "group_session_shared",
+                "group_session_removed",
+            ],
         },
         message: { type: String, required: true, trim: true, maxlength: 200 },
         data: { type: mongoose.Schema.Types.Mixed },

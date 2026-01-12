@@ -31,6 +31,46 @@ try {
 
 const app = createApp();
 
+const ensureTrainingBlockDefaultKeyIndex = async () => {
+    const TrainingBlock = require("./models/TrainingBlock");
+
+    const indexes = await TrainingBlock.collection.indexes();
+    const idx = indexes.find((i) => i.name === "defaultKey_1");
+    const needsFix = idx && (!idx.unique || !idx.sparse);
+
+    if (needsFix) {
+        await TrainingBlock.collection.dropIndex("defaultKey_1");
+    }
+
+    if (!idx || needsFix) {
+        await TrainingBlock.collection.createIndex(
+            { defaultKey: 1 },
+            { unique: true, sparse: true, name: "defaultKey_1" }
+        );
+        console.log("🔧 Index defaultKey_1 recréé en sparse unique");
+    }
+};
+
+const ensureTrainingTemplateDefaultKeyIndex = async () => {
+    const TrainingTemplate = require("./models/TrainingTemplate");
+
+    const indexes = await TrainingTemplate.collection.indexes();
+    const idx = indexes.find((i) => i.name === "defaultKey_1");
+    const needsFix = idx && (!idx.unique || !idx.sparse);
+
+    if (needsFix) {
+        await TrainingTemplate.collection.dropIndex("defaultKey_1");
+    }
+
+    if (!idx || needsFix) {
+        await TrainingTemplate.collection.createIndex(
+            { defaultKey: 1 },
+            { unique: true, sparse: true, name: "defaultKey_1" }
+        );
+        console.log("🔧 Index trainingTemplates.defaultKey_1 recréé en sparse unique");
+    }
+};
+
 const ensureUsernameIndex = async () => {
     // Ensure the username index is sparse to avoid duplicate null errors.
     const User = require("./models/User");
@@ -146,6 +186,37 @@ const start = async () => {
             await ensureLicenseNumberIndex();
         } catch (indexErr) {
             console.warn("⚠️ Impossible de vérifier/créer l'index licenseNumber_1 :", indexErr.message);
+        }
+
+        try {
+            await ensureTrainingBlockDefaultKeyIndex();
+        } catch (indexErr) {
+            console.warn("⚠️ Impossible de vérifier/créer l'index defaultKey_1 :", indexErr.message);
+        }
+
+        try {
+            await ensureTrainingTemplateDefaultKeyIndex();
+        } catch (indexErr) {
+            console.warn(
+                "⚠️ Impossible de vérifier/créer l'index trainingTemplates.defaultKey_1 :",
+                indexErr.message
+            );
+        }
+
+        try {
+            const { seedDefaultTrainingBlocks } = require("./scripts/seedDefaultTrainingBlocks");
+            await seedDefaultTrainingBlocks();
+            console.log("🌱 Blocs par défaut: seed OK");
+        } catch (seedErr) {
+            console.warn("⚠️ Impossible de seed les blocs par défaut :", seedErr.message);
+        }
+
+        try {
+            const { seedDefaultTrainingTemplates } = require("./scripts/seedDefaultTrainingTemplates");
+            await seedDefaultTrainingTemplates();
+            console.log("🌱 Templates par défaut: seed OK");
+        } catch (seedErr) {
+            console.warn("⚠️ Impossible de seed les templates par défaut :", seedErr.message);
         }
 
         const PORT = process.env.PORT || 4001;
