@@ -2,6 +2,7 @@ const TrainingSession = require("../models/TrainingSession");
 const TrainingGroup = require("../models/TrainingGroup");
 const User = require("../models/User");
 const TrainingTemplate = require("../models/TrainingTemplate");
+const { createInboxNotificationsForUsers } = require("../services/inboxNotificationService");
 
 const ensureValidDate = (value) => {
     const parsed = value ? new Date(value) : new Date();
@@ -132,6 +133,31 @@ const isUserMemberOfGroup = (group, userId) => {
         return true;
     }
     return group.members?.some((member) => toStringId(member.user) === userId) || false;
+};
+
+const buildSessionLabel = (session) => {
+    if (!session) return "Séance";
+    const title = typeof session.title === "string" ? session.title.trim() : "";
+    if (title) return title;
+    const type = typeof session.type === "string" ? session.type.trim() : "";
+    return type || "Séance";
+};
+
+const notifyGroupMembers = async (group, excludeUserId, notification) => {
+    try {
+        if (!group) return;
+        const members = Array.isArray(group.members) ? group.members : [];
+        const ownerId = toStringId(group.owner);
+        const excluded = new Set([excludeUserId, ownerId].filter(Boolean));
+
+        const memberIds = members
+            .map((member) => toStringId(member.user))
+            .filter((id) => id && !excluded.has(id));
+
+        await createInboxNotificationsForUsers(memberIds, notification);
+    } catch (e) {
+        console.warn("notifyGroupMembers non bloquant:", e?.message || e);
+    }
 };
 
 const parseChronoToSeconds = (value) => {
@@ -465,6 +491,16 @@ exports.attachSessionToGroup = async (req, res) => {
         await ensureAutomaticStatus(created);
         await created.populate(sessionPopulationPaths);
 
+        await notifyGroupMembers(group, req.user.id, {
+            type: "group_session_shared",
+            message: `Séance "${buildSessionLabel(created)}" partagée dans le groupe "${group.name}"`,
+            data: {
+                groupId: group._id?.toString?.() || req.params.id,
+                sessionId: created._id?.toString?.() || created.id,
+                copiedFromSessionId: sourceSession._id?.toString?.(),
+            },
+        });
+
         res.status(201).json(created);
     } catch (error) {
         console.error("Erreur attachement séance groupe:", error);
@@ -504,6 +540,16 @@ exports.detachSessionFromGroup = async (req, res) => {
 
         if (isCopy) {
             const snapshot = typeof session.toJSON === "function" ? session.toJSON() : session;
+
+            await notifyGroupMembers(group, req.user.id, {
+                type: "group_session_removed",
+                message: `Séance "${buildSessionLabel(snapshot)}" supprimée du groupe "${group.name}"`,
+                data: {
+                    groupId: group._id?.toString?.() || req.params.id,
+                    sessionId: session._id?.toString?.() || session.id,
+                },
+            });
+
             await TrainingSession.deleteOne({ _id: session._id });
             return res.json(snapshot);
         }
@@ -512,6 +558,15 @@ exports.detachSessionFromGroup = async (req, res) => {
         await session.save();
         await ensureAutomaticStatus(session);
         await session.populate(sessionPopulationPaths);
+
+        await notifyGroupMembers(group, req.user.id, {
+            type: "group_session_removed",
+            message: `Séance "${buildSessionLabel(session)}" supprimée du groupe "${group.name}"`,
+            data: {
+                groupId: group._id?.toString?.() || req.params.id,
+                sessionId: session._id?.toString?.() || session.id,
+            },
+        });
 
         res.json(session);
     } catch (error) {
