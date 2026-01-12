@@ -73,6 +73,10 @@ const trainingSeriesSchema = new mongoose.Schema(
 const trainingTemplateSchema = new mongoose.Schema(
     {
         ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+        // Shared templates available to all users (seeded by the server).
+        isDefault: { type: Boolean, default: false, index: true },
+        // Stable identifier for seeded default templates.
+        defaultKey: { type: String, trim: true, unique: true, sparse: true, index: true },
         title: { type: String, required: true, trim: true },
         type: { type: String, enum: ["vitesse", "endurance", "force", "technique", "récupération"], required: true },
         description: { type: String, trim: true },

@@ -79,6 +79,10 @@ const trainingBlockSegmentSchema = new mongoose.Schema(
 const trainingBlockSchema = new mongoose.Schema(
     {
         ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+        // Shared blocks available to all users (seeded by the server).
+        isDefault: { type: Boolean, default: false, index: true },
+        // Stable identifier for seeded default blocks.
+        defaultKey: { type: String, trim: true, unique: true, sparse: true, index: true },
         title: { type: String, required: true, trim: true },
         segment: { type: trainingBlockSegmentSchema, required: true },
         version: { type: Number, default: 1, min: 1 },

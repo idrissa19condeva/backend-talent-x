@@ -252,7 +252,7 @@ exports.createSessionFromTemplate = async (req, res) => {
         if (!template) {
             return res.status(404).json({ message: "Template introuvable" });
         }
-        if (template.ownerId.toString() !== req.user.id) {
+        if (!template.isDefault && template.ownerId.toString() !== req.user.id) {
             return res.status(403).json({ message: "Vous n'avez pas accès à ce template" });
         }
 
