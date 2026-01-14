@@ -11,8 +11,10 @@ const requireEnv = (key) => {
     const value = process.env[key];
     if (!value) {
         const envFileHint = process.env.ENV_FILE ? ` (ENV_FILE=${process.env.ENV_FILE})` : "";
+        const exampleHint = process.env.ENV_FILE ? ` Copy ${process.env.ENV_FILE}.example -> ${process.env.ENV_FILE} and fill values.` : "";
         throw new Error(
             `Missing required env var: ${key}${envFileHint}. ` +
+            `${exampleHint} ` +
             `For E2E, start with: ENV_FILE=.env.e2e (via \"npm run e2e:start\").`
         );
     }
